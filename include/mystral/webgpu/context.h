@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <vector>
+#include <string>
 
 // Forward declare WebGPU types to avoid header dependency
 typedef struct WGPUInstanceImpl* WGPUInstance;
@@ -14,6 +15,15 @@ struct WGPUSurfaceDescriptor;
 namespace mystral {
 namespace webgpu {
 
+// Native callbacks enqueue data; the runtime drains them on its JavaScript thread.
+void notifyUncapturedError(int type, const std::string& message);
+void notifyDeviceLost(int reason, const std::string& message);
+void processDeviceCallbacks();
+void cleanupDeviceBindings();
+// A presentation surface may cache a swapchain after Unconfigure. Retire it before device teardown.
+bool releaseContextSurfaceBeforeDeviceDestroy(WGPUDevice device);
+void retireSurfaceBindings(WGPUSurface surface);
+
 /**
  * WebGPU Context
  *
@@ -24,6 +34,8 @@ class Context {
 public:
     Context();
     ~Context();
+    // The single-device Runtime must be recreated after device destruction.
+    void releaseSurfaceBeforeDeviceDestroy();
 
     /**
      * Initialize WebGPU - create instance only

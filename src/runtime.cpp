@@ -148,7 +148,9 @@ static void installCrashHandlers() {
 
 // Forward declaration for WebGPU bindings
 namespace webgpu {
-    bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void* wgpuQueue, void* wgpuSurface, uint32_t surfaceFormat, uint32_t width, uint32_t height, bool debug = false);
+    bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void* wgpuQueue, void* wgpuSurface, uint32_t surfaceFormat, uint32_t width, uint32_t height, bool debug = false, void* wgpuAdapter = nullptr);
+    void processDeviceCallbacks();
+    void cleanupDeviceBindings();
     void setOffscreenTexture(void* texture, void* textureView);
     void beginDawnFrame();
     void endDawnFrame();
@@ -444,10 +446,12 @@ public:
         // Set up WebGPU bindings in JS
         // For no-SDL mode, pass nullptr for surface (offscreen rendering uses texture directly)
         WGPUSurface surface = config_.noSdl ? nullptr : webgpu_->getSurface();
-        if (!webgpu::initBindings(jsEngine_.get(), webgpu_->getInstance(), webgpu_->getDevice(), webgpu_->getQueue(), surface, webgpu_->getPreferredFormat(), width_, height_, config_.debug)) {
+        if (!webgpu::initBindings(jsEngine_.get(), webgpu_->getInstance(), webgpu_->getDevice(), webgpu_->getQueue(), surface, webgpu_->getPreferredFormat(), width_, height_, config_.debug, webgpu_->getAdapter())) {
             std::cerr << "[Mystral] Failed to initialize WebGPU bindings" << std::endl;
             return false;
         }
+
+        if (!setupDOMModel()) return false;
 
         // In no-SDL mode, set the offscreen texture for headless rendering
         if (config_.noSdl) {
@@ -484,29 +488,48 @@ public:
     }
 
     void shutdown() {
+        const auto shutdownStage = [](const char* stage) {
+#if defined(__ANDROID__)
+            __android_log_print(ANDROID_LOG_INFO, "MystralInterop", "EXIT_STAGE shutdown-%s", stage);
+#else
+            (void)stage;
+#endif
+        };
+        shutdownStage("enter");
         std::cout << "[Mystral] Shutting down runtime..." << std::endl;
         running_ = false;
 
         // Clean up audio resources FIRST before touching JS objects
         // (Audio callback thread may be accessing JS handles)
+        shutdownStage("audio-enter");
         audio::cleanupAudioBindings();
+        shutdownStage("audio-return");
 
         // Clean up ray tracing resources
 #ifdef MYSTRAL_HAS_RAYTRACING
+        shutdownStage("raytracing-enter");
         rt::cleanupRTBindings();
+        shutdownStage("raytracing-return");
 #endif
 
         // Shutdown async HTTP client (cancels pending requests)
+        shutdownStage("http-enter");
         http::getAsyncHttpClient().shutdown();
+        shutdownStage("http-return");
 
         // Shutdown file watcher
+        shutdownStage("file-enter");
         fs::getFileWatcher().shutdown();
+        shutdownStage("file-return");
 
         // Shut down WebTransport sessions (closes QUIC connections + uv handles)
+        shutdownStage("webtransport-enter");
         webtransport::shutdown();
+        shutdownStage("webtransport-return");
 
 #ifdef MYSTRAL_USE_LIBUV_TIMERS
         // Clean up libuv timers before shutting down the event loop
+        shutdownStage("uv-timers-enter");
         for (auto& [id, ctx] : uvTimers_) {
             if (ctx && !ctx->cancelled) {
                 uv_timer_stop(&ctx->handle);
@@ -517,20 +540,26 @@ public:
             }
         }
         uvTimers_.clear();
+        shutdownStage("uv-timers-return");
 #endif
 
         // Shutdown libuv event loop (waits for pending handles to close)
+        shutdownStage("eventloop-enter");
         async::EventLoop::instance().shutdown();
+        shutdownStage("eventloop-return");
 
         // Unprotect all RAF callbacks before clearing
+        shutdownStage("raf-enter");
         if (jsEngine_) {
             for (auto& raf : rafCallbacks_) {
                 jsEngine_->unprotect(raf.callback);
             }
         }
         rafCallbacks_.clear();
+        shutdownStage("raf-return");
 
         // Unprotect all timer callbacks before clearing
+        shutdownStage("timers-enter");
 #ifndef MYSTRAL_USE_LIBUV_TIMERS
         if (jsEngine_) {
             for (auto& timer : timerCallbacks_) {
@@ -542,25 +571,42 @@ public:
         timerCallbacks_.clear();
 #endif
         cancelledTimerIds_.clear();
+        shutdownStage("timers-return");
 
+        shutdownStage("modules-enter");
         if (moduleSystem_) {
             moduleSystem_->clearCaches();
             js::setModuleSystem(nullptr);
             moduleSystem_.reset();
         }
+        shutdownStage("modules-return");
 
         // Run garbage collection before destroying the engine
         // This helps clean up any lingering Promise objects, etc.
         if (jsEngine_) {
+            shutdownStage("gc1-enter");
             jsEngine_->gc();
+            shutdownStage("gc1-return");
+            shutdownStage("gc2-enter");
             jsEngine_->gc();  // Run twice for good measure
+            shutdownStage("gc2-return");
         }
 
+        shutdownStage("devicebindings-enter");
+        webgpu::cleanupDeviceBindings();
+        shutdownStage("devicebindings-return");
+        shutdownStage("jsEngine-enter");
         jsEngine_.reset();    // Release JS engine
+        shutdownStage("jsEngine-return");
+        shutdownStage("webgpu-enter");
         webgpu_.reset();      // Release WebGPU resources
+        shutdownStage("webgpu-return");
+        shutdownStage("window-enter");
         if (!config_.noSdl) {
             platform::destroyWindow();
         }
+        shutdownStage("window-return");
+        shutdownStage("complete");
     }
 
     // ========================================================================
@@ -577,6 +623,15 @@ public:
 
         // Store script path for reloading
         scriptPath_ = path;
+        std::string documentUrl = path;
+        const bool pathIsUrl = path.find("://") != std::string::npos;
+        if (!pathIsUrl) {
+            documentUrl = std::filesystem::absolute(path).generic_string();
+            documentUrl = (documentUrl.front() == '/' ? "file://" : "file:///") + documentUrl;
+        }
+        jsEngine_->setGlobalProperty("__nativeEntryDocumentURL", jsEngine_->newString(documentUrl.c_str()));
+        if (!jsEngine_->eval(pathIsUrl ? "__nativeSetDocumentURL(__nativeEntryDocumentURL);"
+            : "__nativeSetDocumentURL(encodeURI(__nativeEntryDocumentURL));", "document-url")) return false;
 
         // Set up file watching if watch mode is enabled
         if (config_.watch && fs::getFileWatcher().isReady()) {
@@ -770,6 +825,8 @@ public:
         // Process completed async HTTP requests (invoke their JS callbacks)
         // This must be called after runOnce() to invoke callbacks safely on the main thread
         http::getAsyncHttpClient().processCompletedRequests();
+        // WebGPU callbacks only touch JS on this runtime's main thread.
+        webgpu::processDeviceCallbacks();
 
         // Drive WebTransport QUIC sessions and dispatch their JS events (main thread)
         webtransport::processEvents();
@@ -1591,9 +1648,28 @@ private:
             })
         );
 
+        auto readHttpHeaders = [this](js::JSValueHandle object, http::HttpOptions& options) {
+            auto headers = jsEngine_->getProperty(object, "headers");
+            if (jsEngine_->isUndefined(headers) || jsEngine_->isNull(headers)) return true;
+            if (!jsEngine_->isArray(headers)) {
+                jsEngine_->throwException("Native HTTP headers require a normalized pair sequence");
+                return false;
+            }
+            const int count = static_cast<int>(jsEngine_->toNumber(jsEngine_->getProperty(headers, "length")));
+            for (int i = 0; i < count; ++i) {
+                auto pair = jsEngine_->getPropertyIndex(headers, i);
+                if (!jsEngine_->isArray(pair) || jsEngine_->toNumber(jsEngine_->getProperty(pair, "length")) != 2) {
+                    jsEngine_->throwException("Invalid HTTP header pair");
+                    return false;
+                }
+                options.headers[jsEngine_->toString(jsEngine_->getPropertyIndex(pair, 0))] =
+                    jsEngine_->toString(jsEngine_->getPropertyIndex(pair, 1));
+            }
+            return true;
+        };
         // Native HTTP request function
         jsEngine_->setGlobalProperty("__httpRequest",
-            jsEngine_->newFunction("__httpRequest", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
+            jsEngine_->newFunction("__httpRequest", [this, readHttpHeaders](void* ctx, const std::vector<js::JSValueHandle>& args) {
                 if (args.empty()) {
                     return jsEngine_->newNull();
                 }
@@ -1612,11 +1688,7 @@ private:
                         method = jsEngine_->toString(methodVal);
                     }
 
-                    auto headersVal = jsEngine_->getProperty(optObj, "headers");
-                    if (!jsEngine_->isUndefined(headersVal)) {
-                        // Get header keys - this is simplified, real impl would iterate
-                        // For now, just handle common headers
-                    }
+                    if (!readHttpHeaders(optObj, options)) return jsEngine_->newUndefined();
 
                     auto bodyVal = jsEngine_->getProperty(optObj, "body");
                     if (!jsEngine_->isUndefined(bodyVal)) {
@@ -1667,7 +1739,7 @@ private:
         // Async HTTP request function - uses libuv for non-blocking I/O
         // Takes (url, options, callback) where callback receives the result object
         jsEngine_->setGlobalProperty("__httpRequestAsync",
-            jsEngine_->newFunction("__httpRequestAsync", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
+            jsEngine_->newFunction("__httpRequestAsync", [this, readHttpHeaders](void* ctx, const std::vector<js::JSValueHandle>& args) {
                 if (args.size() < 3) {
                     std::cerr << "[HTTP Async] Missing arguments (need url, options, callback)" << std::endl;
                     return jsEngine_->newUndefined();
@@ -1686,6 +1758,8 @@ private:
                     if (!jsEngine_->isUndefined(methodVal)) {
                         method = jsEngine_->toString(methodVal);
                     }
+
+                    if (!readHttpHeaders(optObj, options)) return jsEngine_->newUndefined();
 
                     auto bodyVal = jsEngine_->getProperty(optObj, "body");
                     if (!jsEngine_->isUndefined(bodyVal)) {
@@ -2080,6 +2154,7 @@ async function fetch(input, options = {}) {
 
     // Check URL type
     if (url.startsWith('http://') || url.startsWith('https://')) {
+        options = { ...options, headers: Array.from(new Headers(options.headers || {})) };
         // HTTP/HTTPS request via async libcurl + libuv (non-blocking)
         return new Promise((resolve, reject) => {
             if (signal) signal.addEventListener('abort', () => reject(abortError()));
@@ -3901,6 +3976,401 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
         std::cout << "[Mystral] DOM event system initialized" << std::endl;
     }
 
+    // A small window-backed document: real tree/events and px/% block layout, not a CSS engine.
+    // Run after WebGPU bindings so native canvas/2D factories keep their actual contexts.
+    bool setupDOMModel() {
+        auto navigator = jsEngine_->getGlobalProperty("navigator");
+#ifdef _WIN32
+        const char* nativePlatform = "Win32";
+#elif defined(__APPLE__)
+        const char* nativePlatform = "MacIntel";
+#else
+        const char* nativePlatform = "Linux";
+#endif
+        const std::string version = std::string("MystralNative/") + getVersion() + " (" + nativePlatform + ")";
+        jsEngine_->setProperty(navigator, "userAgent", jsEngine_->newString(version.c_str()));
+        jsEngine_->setProperty(navigator, "appVersion", jsEngine_->newString(version.c_str()));
+        jsEngine_->setProperty(navigator, "platform", jsEngine_->newString(nativePlatform));
+        const unsigned int threads = std::thread::hardware_concurrency();
+        jsEngine_->setProperty(navigator, "hardwareConcurrency", jsEngine_->newNumber(threads ? threads : 1));
+        auto screen = jsEngine_->newObject();
+        SDL_Rect displayBounds{0, 0, width_, height_};
+        if (!config_.noSdl) {
+            jsEngine_->setGlobalProperty("devicePixelRatio", jsEngine_->newNumber(
+                SDL_GetWindowPixelDensity(platform::getSDLWindow())));
+            SDL_GetDisplayBounds(SDL_GetDisplayForWindow(platform::getSDLWindow()), &displayBounds);
+        }
+        jsEngine_->setProperty(screen, "width", jsEngine_->newNumber(displayBounds.w));
+        jsEngine_->setProperty(screen, "height", jsEngine_->newNumber(displayBounds.h));
+        jsEngine_->setProperty(screen, "colorDepth", jsEngine_->newNumber(24));
+        jsEngine_->setProperty(screen, "pixelDepth", jsEngine_->newNumber(24));
+        jsEngine_->setGlobalProperty("screen", screen);
+        const char* source = R"DOM(
+(() => {
+    const nativeCreateElement = document.createElement.bind(document);
+    const nativeCreateImageBitmap = globalThis.createImageBitmap;
+    const nativeCanvas = globalThis.canvas;
+    const listeners = new WeakMap();
+    const pointerCapture = new Map();
+    const activePointers = new Set();
+    const internal = {};
+    const domError = (name, message) => Object.assign(new Error(message), { name });
+    class Event {
+        constructor(type, options = {}) {
+            this.type = String(type); this.bubbles = !!options.bubbles; this.cancelable = !!options.cancelable;
+            this.composed = !!options.composed; this.defaultPrevented = false; this.target = null;
+            this.currentTarget = null; this.eventPhase = 0; this.isTrusted = false;
+            this.timeStamp = performance.now(); this._stopped = false; this._immediate = false;
+        }
+        preventDefault() { if (this.cancelable && !this._passive) this.defaultPrevented = true; }
+        stopPropagation() { this._stopped = true; }
+        stopImmediatePropagation() { this._immediate = this._stopped = true; }
+        composedPath() { return (this._path || []).slice(); }
+    }
+    Object.assign(Event, { NONE: 0, CAPTURING_PHASE: 1, AT_TARGET: 2, BUBBLING_PHASE: 3 });
+    class CustomEvent extends Event {
+        constructor(type, options = {}) { super(type, options); this.detail = options.detail ?? null; }
+    }
+    class UIEvent extends Event {
+        constructor(type, options = {}) { super(type, options); this.view = options.view ?? null; this.detail = options.detail ?? 0; }
+    }
+    class MouseEvent extends UIEvent {
+        constructor(type, options = {}) {
+            super(type, options);
+            for (const key of ['clientX', 'clientY', 'screenX', 'screenY', 'movementX', 'movementY', 'button', 'buttons']) this[key] = Number(options[key] || 0);
+            for (const key of ['ctrlKey', 'shiftKey', 'altKey', 'metaKey']) this[key] = !!options[key];
+            this.relatedTarget = options.relatedTarget ?? null;
+        }
+    }
+    class KeyboardEvent extends UIEvent {
+        constructor(type, options = {}) { super(type, options); this.key = options.key || ''; this.code = options.code || ''; this.repeat = !!options.repeat; this.keyCode = Number(options.keyCode || 0); for (const key of ['ctrlKey', 'shiftKey', 'altKey', 'metaKey']) this[key] = !!options[key]; }
+    }
+    class PointerEvent extends MouseEvent {
+        constructor(type, options = {}) { super(type, options); this.pointerId = Number(options.pointerId || 0); this.pointerType = options.pointerType || ''; this.isPrimary = !!options.isPrimary; this.width = options.width ?? 1; this.height = options.height ?? 1; this.pressure = options.pressure ?? 0; }
+    }
+    class WheelEvent extends MouseEvent {
+        constructor(type, options = {}) { super(type, options); for (const key of ['deltaX', 'deltaY', 'deltaZ', 'deltaMode']) this[key] = Number(options[key] || 0); }
+    }
+    class EventTarget {
+        addEventListener(type, callback, options = {}) {
+            if (callback == null) return;
+            if (typeof callback !== 'function' && typeof callback.handleEvent !== 'function')
+                throw new TypeError('Event listener must be callable or implement handleEvent');
+            if (typeof options === 'boolean') options = { capture: options };
+            options = options || {};
+            if (options.signal?.aborted) return;
+            const rows = listeners.get(this) || [];
+            type = String(type);
+            if (rows.some(row => row.type === type && row.callback === callback && row.capture === !!options.capture)) return;
+            const row = { type, callback, capture: !!options.capture, once: !!options.once, passive: !!options.passive };
+            rows.push(row); listeners.set(this, rows);
+            options.signal?.addEventListener('abort', () => this.removeEventListener(type, callback, row.capture), { once: true });
+        }
+        removeEventListener(type, callback, options = {}) {
+            const capture = typeof options === 'boolean' ? options : !!options?.capture;
+            const rows = listeners.get(this) || [];
+            listeners.set(this, rows.filter(row => !(row.type === String(type) && row.callback === callback && row.capture === capture)));
+        }
+        dispatchEvent(event) {
+            if (!(event instanceof Event)) throw new TypeError('dispatchEvent requires an Event');
+            if (event.eventPhase || !event.type) throw domError('InvalidStateError', 'Event is already being dispatched or has no type');
+            const path = [this];
+            if (this instanceof Node) {
+                for (let node = this.parentNode; node; node = node.parentNode) path.push(node);
+                if (path[path.length - 1] === document) path.push(globalThis);
+            }
+            event.target = this; event._path = path; event._stopped = event._immediate = false;
+            const invoke = (target, capture, phase) => {
+                event.currentTarget = target; event.eventPhase = phase;
+                for (const row of (listeners.get(target) || []).slice()) {
+                    if (event._immediate) break;
+                    if (row.type !== event.type || row.capture !== capture || !(listeners.get(target) || []).includes(row)) continue;
+                    if (row.once) EventTarget.prototype.removeEventListener.call(target, row.type, row.callback, row.capture);
+                    event._passive = row.passive;
+                    try {
+                        if (typeof row.callback === 'function') row.callback.call(target, event);
+                        else row.callback.handleEvent(event);
+                    } catch (error) { setTimeout(() => { throw error; }, 0); }
+                    finally { event._passive = false; }
+                }
+                if (!capture && !event._immediate && typeof target['on' + event.type] === 'function')
+                    target['on' + event.type].call(target, event);
+            };
+            try {
+                for (let i = path.length - 1; i > 0 && !event._stopped; i--) invoke(path[i], true, 1);
+                if (!event._stopped) { invoke(this, true, 2); if (!event._immediate) invoke(this, false, 2); }
+                if (event.bubbles) for (let i = 1; i < path.length && !event._stopped; i++) invoke(path[i], false, 3);
+            } finally { event.currentTarget = null; event.eventPhase = 0; }
+            return !event.defaultPrevented;
+        }
+    }
+    class Node extends EventTarget {
+        constructor(token) {
+            super(); if (token !== internal) throw new TypeError('Illegal constructor');
+            this.childNodes = []; this.parentNode = null; this.ownerDocument = null; this.nodeType = 1;
+        }
+        get parentElement() { return this.parentNode?.nodeType === 1 ? this.parentNode : null; }
+        get children() { return this.childNodes.filter(node => node.nodeType === 1); }
+        get firstChild() { return this.childNodes[0] || null; }
+        get lastChild() { return this.childNodes[this.childNodes.length - 1] || null; }
+        get nextSibling() { const nodes = this.parentNode?.childNodes; return nodes?.[nodes.indexOf(this) + 1] || null; }
+        get previousSibling() { const nodes = this.parentNode?.childNodes; return nodes?.[nodes.indexOf(this) - 1] || null; }
+        get isConnected() { let node = this; while (node.parentNode) node = node.parentNode; return node === document; }
+        get baseURI() { return (this.ownerDocument || document).baseURI; }
+        contains(node) { for (; node; node = node.parentNode) if (node === this) return true; return false; }
+        appendChild(node) { return this.insertBefore(node, null); }
+        insertBefore(node, reference) {
+            if (!(node instanceof Node)) throw new TypeError('Child must be a Node');
+            if (reference != null && reference.parentNode !== this) throw domError('NotFoundError', 'Reference is not a child');
+            if (node === this || node.contains(this)) throw domError('HierarchyRequestError', 'Insertion would create a cycle');
+            if (node === reference) return node;
+            if (node.parentNode) node.parentNode.removeChild(node);
+            const index = reference == null ? this.childNodes.length : this.childNodes.indexOf(reference);
+            this.childNodes.splice(index, 0, node); node.parentNode = this;
+            const adopt = value => { value.ownerDocument = this.nodeType === 9 ? this : this.ownerDocument; value.childNodes.forEach(adopt); };
+            adopt(node); return node;
+        }
+        removeChild(node) {
+            if (node.parentNode !== this) throw domError('NotFoundError', 'Node is not a child');
+            this.childNodes.splice(this.childNodes.indexOf(node), 1); node.parentNode = null;
+            if (node.contains(document.activeElement)) document.activeElement = document.body;
+            return node;
+        }
+        replaceChild(node, old) { this.insertBefore(node, old); this.removeChild(old); return old; }
+        remove() { if (this.parentNode) this.parentNode.removeChild(this); }
+        append(...nodes) { nodes.forEach(node => this.appendChild(node instanceof Node ? node : document.createTextNode(String(node)))); }
+        get textContent() { return this.nodeType === 3 ? this.data : this.childNodes.map(node => node.textContent).join(''); }
+        set textContent(value) {
+            if (this.nodeType === 3) { this.data = String(value ?? ''); return; }
+            for (const child of this.childNodes.slice()) this.removeChild(child);
+            if (value != null && String(value)) this.appendChild(document.createTextNode(String(value)));
+        }
+    }
+    class Text extends Node {
+        constructor(data = '') { super(internal); this.nodeType = 3; this.nodeName = '#text'; this.data = String(data); }
+    }
+    const camel = name => name.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
+    class CSSStyleDeclaration {
+        setProperty(name, value) { this[camel(String(name))] = String(value); }
+        getPropertyValue(name) { return this[camel(String(name))] || ''; }
+        removeProperty(name) { const value = this.getPropertyValue(name); delete this[camel(String(name))]; return value; }
+        get cssText() { return Object.entries(this).map(([key, value]) => `${key.replace(/[A-Z]/g, c => '-' + c.toLowerCase())}:${value}`).join(';'); }
+        set cssText(value) { for (const key of Object.keys(this)) delete this[key]; for (const part of String(value).split(';')) { const colon = part.indexOf(':'); if (colon > 0) this.setProperty(part.slice(0, colon).trim(), part.slice(colon + 1).trim()); } }
+    }
+    function simpleMatch(element, selector) {
+        const parts = selector.match(/^([\w*-]+)?((?:#[\w-]+|\.[\w-]+|\[[^\]]+\])*)$/);
+        if (!parts || !selector) throw domError('SyntaxError', 'Unsupported or invalid selector: ' + selector);
+        if (parts[1] && parts[1] !== '*' && parts[1].toUpperCase() !== element.tagName) return false;
+        for (const token of parts[2].match(/#[\w-]+|\.[\w-]+|\[[^\]]+\]/g) || []) {
+            if (token[0] === '#' && element.id !== token.slice(1)) return false;
+            if (token[0] === '.' && !element.className.split(/\s+/).includes(token.slice(1))) return false;
+            if (token[0] === '[') {
+                const [name, expected] = token.slice(1, -1).split('=');
+                if (!element.hasAttribute(name) || expected != null && element.getAttribute(name) !== expected.replace(/^['"]|['"]$/g, '')) return false;
+            }
+        }
+        return true;
+    }
+    function matches(element, selector) {
+        return String(selector).split(',').some(group => {
+            const parts = group.trim().split(/\s+/); let node = element;
+            if (!simpleMatch(node, parts.pop())) return false;
+            while (parts.length) { const part = parts.pop(); do { node = node.parentElement; } while (node && !simpleMatch(node, part)); if (!node) return false; }
+            return true;
+        });
+    }
+    function query(root, selector) {
+        const result = [];
+        const visit = node => { for (const child of node.children) { if (matches(child, selector)) result.push(child); visit(child); } };
+        visit(root); return result;
+    }
+    function computed(element) {
+        const style = new CSSStyleDeclaration();
+        Object.assign(style, { display: ['SPAN', 'IMG'].includes(element.tagName) ? 'inline' : 'block', position: 'static', boxSizing: 'content-box', paddingLeft: '0px', paddingRight: '0px', paddingTop: '0px', paddingBottom: '0px', marginLeft: '0px', marginTop: '0px' });
+        for (const sheet of document.head?.children || []) if (sheet.tagName === 'STYLE') {
+            const rules = sheet.textContent.matchAll(/([^{}]+)\{([^{}]*)\}/g);
+            for (const rule of rules) {
+                try { if (matches(element, rule[1].trim())) { const declarations = new CSSStyleDeclaration(); declarations.cssText = rule[2]; Object.assign(style, declarations); } }
+                catch (_) { /* Pseudo selectors and unsupported CSS do not acquire fabricated matches. */ }
+            }
+        }
+        return Object.assign(style, element.style);
+    }
+    function length(value, reference) {
+        if (!value || value === 'auto') return null;
+        if (/^-?\d+(\.\d+)?%$/.test(value)) return parseFloat(value) * reference / 100;
+        if (/^-?\d+(\.\d+)?(px)?$/.test(value)) return parseFloat(value);
+        throw domError('NotSupportedError', 'Native document layout supports px and percent lengths: ' + value);
+    }
+    function definiteHeight(element) {
+        if (!element || element === document.documentElement) return true;
+        const value = computed(element).height;
+        if (!value || value === 'auto') return false;
+        return /%$/.test(value) ? definiteHeight(element.parentElement) : length(value, 0) !== null;
+    }
+    function dimension(element, axis, seen = new Set()) {
+        if (seen.has(element)) return 0;
+        seen.add(element);
+        const style = computed(element);
+        if (style.display === 'none') return 0;
+        const viewport = axis === 'width' ? innerWidth : innerHeight;
+        const parentSize = element.parentElement ? dimension(element.parentElement, axis, new Set(seen)) : viewport;
+        // A percentage height in an auto-height containing block has used value auto.
+        // In particular a replaced canvas retains its drawing-buffer intrinsic height.
+        const unresolvedHeight = axis === 'height' && /%$/.test(style.height || '') && !definiteHeight(element.parentElement);
+        const explicit = unresolvedHeight ? null : length(style[axis], parentSize);
+        if (explicit != null) return Math.max(0, explicit);
+        if (element === document.documentElement || element === document.body) return viewport;
+        if (element instanceof HTMLCanvasElement) return element[axis] / devicePixelRatio;
+        if (axis === 'width') return parentSize;
+        return element.children.reduce((total, child) => total + dimension(child, axis, new Set(seen)), 0);
+    }
+    class HTMLElement extends Node {
+        constructor() { super(internal); throw new TypeError('Illegal constructor'); }
+        get clientWidth() { return Math.round(dimension(this, 'width')); }
+        get clientHeight() { return Math.round(dimension(this, 'height')); }
+        get offsetWidth() { return this.clientWidth; } get offsetHeight() { return this.clientHeight; }
+        get scrollWidth() { return this.clientWidth; } get scrollHeight() { return this.clientHeight; }
+        getBoundingClientRect() {
+            const parent = this.parentElement?.getBoundingClientRect(); const style = computed(this);
+            const x = (parent?.x || 0) + (length(style.left, parent?.width || innerWidth) || 0);
+            const y = (parent?.y || 0) + (length(style.top, parent?.height || innerHeight) || 0);
+            const width = dimension(this, 'width'), height = dimension(this, 'height');
+            return { x, y, width, height, top: y, left: x, right: x + width, bottom: y + height, toJSON() { return { x, y, width, height }; } };
+        }
+        querySelector(selector) { return query(this, selector)[0] || null; }
+        querySelectorAll(selector) { return query(this, selector); }
+        matches(selector) { return matches(this, selector); }
+        closest(selector) { for (let node = this; node; node = node.parentElement) if (matches(node, selector)) return node; return null; }
+        setAttribute(name, value) { name = String(name).toLowerCase(); if (name === 'style') this.style.cssText = value; else if (name === 'id' || name === 'class') this[name === 'class' ? 'className' : name] = String(value); else this._attributes[name] = String(value); }
+        getAttribute(name) { name = String(name).toLowerCase(); if (name === 'id' || name === 'class') return this[name === 'class' ? 'className' : name] || null; if (name === 'style') return this.style.cssText || null; return this._attributes[name] ?? null; }
+        hasAttribute(name) { return this.getAttribute(name) !== null; }
+        removeAttribute(name) { if (name === 'id' || name === 'class') this[name === 'class' ? 'className' : name] = ''; else if (name === 'style') this.style.cssText = ''; else delete this._attributes[name]; }
+        focus() { if (!this.isConnected || this.tabIndex < 0) return; const before = document.activeElement; if (before === this) return; document.activeElement = this; before?.dispatchEvent(new Event('blur')); this.dispatchEvent(new Event('focus')); this.dispatchEvent(new Event('focusin', { bubbles: true })); }
+        blur() { if (document.activeElement === this) { document.activeElement = document.body; this.dispatchEvent(new Event('blur')); this.dispatchEvent(new Event('focusout', { bubbles: true })); } }
+        get isContentEditable() { const value = this.getAttribute('contenteditable'); return value === '' || value === 'true' || value == null && !!this.parentElement?.isContentEditable; }
+        get innerHTML() { return this.textContent; }
+        set innerHTML(value) { if (value && this.tagName !== 'STYLE' && this.tagName !== 'SCRIPT') throw domError('NotSupportedError', 'Native document has no HTML parser'); this.textContent = value; }
+        setPointerCapture(id) { if (!activePointers.has(id)) throw domError('NotFoundError', 'Pointer is not active'); pointerCapture.set(id, this); }
+        releasePointerCapture(id) { if (pointerCapture.get(id) === this) { pointerCapture.delete(id); const event = new Event('lostpointercapture'); event.pointerId = id; this.dispatchEvent(event); } }
+        hasPointerCapture(id) { return pointerCapture.get(id) === this; }
+    }
+    class HTMLCanvasElement extends HTMLElement {}
+    class HTMLImageElement extends HTMLElement {
+        constructor(width = 0, height = 0) {
+            const element = upgrade(nativeCreateElement('img'), 'IMG');
+            element.width = Number(width); element.height = Number(height); element.complete = true;
+            element.naturalWidth = element.naturalHeight = 0;
+            return element;
+        }
+        get src() { return this._source || ''; }
+        set src(value) {
+            const requested = String(value); this._attributes.src = requested;
+            this._source = new URL(requested, document.baseURI).href; this.complete = false;
+            this._decodePromise = fetch(this._source).then(response => {
+                if (!response.ok) throw new Error('Image HTTP ' + response.status);
+                return response.blob();
+            }).then(blob => nativeCreateImageBitmap(blob)).then(bitmap => {
+                if (this._attributes.src !== requested) { bitmap.close(); return; }
+                this._bitmap?.close(); this._bitmap = bitmap; this._data = bitmap._data;
+                this.naturalWidth = bitmap.width; this.naturalHeight = bitmap.height;
+                if (!this.width) this.width = bitmap.width; if (!this.height) this.height = bitmap.height;
+                this.complete = true; this.dispatchEvent(new Event('load'));
+            }).catch(error => { this.complete = true; this.dispatchEvent(new Event('error')); throw error; });
+            this._decodePromise.catch(() => {});
+        }
+        decode() { return this._decodePromise || Promise.reject(domError('EncodingError', 'Image has no decoded source')); }
+    }
+    function upgrade(element, tag) {
+        const style = Object.assign(new CSSStyleDeclaration(), element.style || {});
+        // Native factories used to attach placeholders such as own parentElement.
+        // Remove every shadow of our DOM prototypes while retaining native canvas contexts/data.
+        const inherited = new Set([EventTarget, Node, HTMLElement, HTMLCanvasElement, HTMLImageElement]
+            .flatMap(Type => Object.getOwnPropertyNames(Type.prototype)));
+        for (const name of inherited) if (name !== 'constructor') delete element[name];
+        Object.setPrototypeOf(element, tag === 'CANVAS' ? HTMLCanvasElement.prototype : tag === 'IMG' ? HTMLImageElement.prototype : HTMLElement.prototype);
+        element.childNodes = []; element.parentNode = null; element.ownerDocument = document; element.nodeType = 1;
+        element.tagName = element.nodeName = tag; element.style = style; element._attributes = {};
+        element.id = element.id || ''; element.className = element.className || ''; element.tabIndex = -1;
+        if (tag === 'CANVAS') {
+            const nativeGetContext = element.getContext;
+            let width = element.width, height = element.height, context2d;
+            const dimension = (value, fallback) => {
+                const number = Number(value);
+                return Number.isFinite(number) && number >= 0 ? Math.trunc(number) >>> 0 : fallback;
+            };
+            const reset = () => context2d?.__resizeDrawingBuffer(width, height);
+            Object.defineProperty(element, 'width', { configurable: true, enumerable: true,
+                get: () => width, set(value) { width = dimension(value, 300); reset(); } });
+            Object.defineProperty(element, 'height', { configurable: true, enumerable: true,
+                get: () => height, set(value) { height = dimension(value, 150); reset(); } });
+            element.getContext = function(type, ...options) {
+                if (type === '2d' && context2d) return context2d;
+                const context = nativeGetContext.call(this, type, ...options);
+                if (type === '2d' && context) { context2d = context; context.canvas = this; reset(); }
+                return context;
+            };
+        }
+        return element;
+    }
+    Object.assign(globalThis, { Event, CustomEvent, UIEvent, MouseEvent, KeyboardEvent, PointerEvent, WheelEvent, EventTarget, Node, Element: HTMLElement, HTMLElement, HTMLCanvasElement, HTMLImageElement, Image: HTMLImageElement, Text, CSSStyleDeclaration, top: globalThis, parent: globalThis });
+    for (const name of ['onmousedown', 'onmouseup', 'onmousemove', 'onkeydown', 'onkeyup', 'onkeypress', 'onwheel', 'onpointerdown', 'onpointerup', 'onpointermove']) HTMLElement.prototype[name] = null;
+    const newDocument = Object.create(Node.prototype);
+    Object.assign(newDocument, { childNodes: [], parentNode: null, ownerDocument: null, nodeType: 9, nodeName: '#document', readyState: 'complete', hidden: false, visibilityState: 'visible', fullscreenEnabled: false, fullscreenElement: null, defaultView: globalThis });
+    globalThis.document = newDocument;
+    newDocument.createElement = tag => {
+        tag = String(tag).toLowerCase(); if (tag === 'img') return new HTMLImageElement();
+        const element = upgrade(nativeCreateElement(tag), tag.toUpperCase());
+        if (tag === 'canvas') { element.width = 300; element.height = 150; }
+        return element;
+    };
+    newDocument.createElementNS = (_, tag) => newDocument.createElement(tag);
+    newDocument.createTextNode = text => { const node = new Text(text); node.ownerDocument = newDocument; return node; };
+    newDocument.querySelector = selector => query(newDocument, selector)[0] || null;
+    newDocument.querySelectorAll = selector => query(newDocument, selector);
+    newDocument.getElementById = id => { const visit = node => { for (const child of node.children) { if (child.id === String(id)) return child; const found = visit(child); if (found) return found; } return null; }; return visit(newDocument); };
+    newDocument.getElementsByTagName = tag => query(newDocument, String(tag));
+    newDocument.documentElement = newDocument.createElement('html');
+    newDocument.head = newDocument.createElement('head'); newDocument.body = newDocument.createElement('body');
+    newDocument.appendChild(newDocument.documentElement); newDocument.documentElement.appendChild(newDocument.head); newDocument.documentElement.appendChild(newDocument.body);
+    newDocument.body.style.cssText = 'margin:0;width:100%;height:100%';
+    newDocument.activeElement = newDocument.body;
+    newDocument.hasFocus = () => !newDocument.hidden;
+    newDocument.body.appendChild(upgrade(nativeCanvas, 'CANVAS'));
+    nativeCanvas.style.width = nativeCanvas.style.height = '100%';
+    let documentURL = 'about:blank';
+    Object.defineProperty(newDocument, 'baseURI', { get() { const base = newDocument.querySelector('base[href]'); return base ? new URL(base.getAttribute('href'), documentURL).href : documentURL; } });
+    globalThis.__nativeSetDocumentURL = href => { documentURL = new URL(href).href; globalThis.location = newDocument.location = new URL(documentURL); newDocument.URL = newDocument.documentURI = documentURL; };
+    __nativeSetDocumentURL(documentURL);
+    globalThis.getComputedStyle = element => { const style = computed(element); style.width = dimension(element, 'width') + 'px'; style.height = dimension(element, 'height') + 'px'; return style; };
+    globalThis.createImageBitmap = async (source, ...options) => {
+        if (source instanceof HTMLCanvasElement) {
+            const context = source.getContext('2d');
+            if (!context || !source.width || !source.height) throw domError('InvalidStateError', 'Canvas has no readable 2D image');
+            const image = context.getImageData(0, 0, source.width, source.height);
+            const bytes = new Uint8Array(image.data.buffer, image.data.byteOffset, image.data.byteLength).slice();
+            return new ImageBitmap(source.width, source.height, bytes.buffer);
+        }
+        if (source instanceof HTMLImageElement) { await source.decode(); return new ImageBitmap(source.naturalWidth, source.naturalHeight, source._data.slice(0)); }
+        return nativeCreateImageBitmap(source, ...options);
+    };
+    for (const name of ['addEventListener', 'removeEventListener', 'dispatchEvent']) globalThis[name] = EventTarget.prototype[name];
+    globalThis.__nativeDispatchDOMEvent = (targetName, data) => {
+        const target = targetName === 'window' ? globalThis : targetName === 'document' ? document : targetName === 'keyboard' ? document.activeElement : pointerCapture.get(data.pointerId) || nativeCanvas;
+        const Type = /^key/.test(data.type) ? KeyboardEvent : /^pointer/.test(data.type) ? PointerEvent : data.type === 'wheel' ? WheelEvent : /^mouse/.test(data.type) ? MouseEvent : Event;
+        const event = new Type(data.type, { bubbles: target !== globalThis, cancelable: targetName !== 'window' });
+        for (const key of Object.keys(data)) if (!['preventDefault', 'stopPropagation', 'stopImmediatePropagation'].includes(key)) event[key] = data[key];
+        event.isTrusted = true;
+        if (event.type === 'pointerdown') activePointers.add(event.pointerId);
+        target.dispatchEvent(event);
+        if (event.type === 'pointerup' || event.type === 'pointercancel') { activePointers.delete(event.pointerId); pointerCapture.delete(event.pointerId); }
+        return !event.defaultPrevented;
+    };
+})();
+)DOM";
+        return jsEngine_->eval(source, "window-backed-dom");
+    }
+
     void dispatchKeyboardEvent(const platform::KeyboardEventData& e) {
         auto event = jsEngine_->newObject();
         jsEngine_->setProperty(event, "type", jsEngine_->newString(e.type.c_str()));
@@ -3926,9 +4396,7 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
         );
 
         // Dispatch to document, window, and canvas listeners
-        dispatchToListeners("document", e.type, event);
-        dispatchToListeners("window", e.type, event);
-        dispatchToListeners("canvas", e.type, event);
+        dispatchToListeners("keyboard", e.type, event);
     }
 
     void dispatchMouseEvent(const platform::MouseEventData& e) {
@@ -3960,8 +4428,6 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
             })
         );
 
-        dispatchToListeners("document", e.type, event);
-        dispatchToListeners("window", e.type, event);
         dispatchToListeners("canvas", e.type, event);
     }
 
@@ -4001,8 +4467,6 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
             })
         );
 
-        dispatchToListeners("document", e.type, event);
-        dispatchToListeners("window", e.type, event);
         dispatchToListeners("canvas", e.type, event);
     }
 
@@ -4026,8 +4490,6 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
             })
         );
 
-        dispatchToListeners("document", e.type, event);
-        dispatchToListeners("window", e.type, event);
         dispatchToListeners("canvas", e.type, event);
     }
 
@@ -4055,6 +4517,8 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
         auto window = jsEngine_->getGlobal();
         jsEngine_->setProperty(window, "innerWidth", jsEngine_->newNumber(e.width));
         jsEngine_->setProperty(window, "innerHeight", jsEngine_->newNumber(e.height));
+        if (!config_.noSdl) jsEngine_->setProperty(window, "devicePixelRatio", jsEngine_->newNumber(
+            SDL_GetWindowPixelDensity(platform::getSDLWindow())));
 
         auto event = jsEngine_->newObject();
         jsEngine_->setProperty(event, "type", jsEngine_->newString("resize"));
@@ -4063,6 +4527,11 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
     }
 
     void dispatchToListeners(const std::string& target, const std::string& eventType, js::JSValueHandle event) {
+        auto dispatch = jsEngine_->getGlobalProperty("__nativeDispatchDOMEvent");
+        if (jsEngine_->isFunction(dispatch)) {
+            jsEngine_->call(dispatch, jsEngine_->newUndefined(), {jsEngine_->newString(target.c_str()), event});
+            return;
+        }
         auto targetIt = eventListeners_.find(target);
         if (targetIt == eventListeners_.end()) {
             // Debug: no listeners registered for this target

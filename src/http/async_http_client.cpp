@@ -15,6 +15,9 @@
 #include <queue>
 #include <mutex>
 #include <cstring>
+#include <atomic>
+#include <thread>
+#include <algorithm>
 
 // Only compile the full implementation when both libuv and curl are available
 #if defined(MYSTRAL_HAS_LIBUV) && !defined(MYSTRAL_HTTP_FOUNDATION) && !defined(MYSTRAL_HTTP_ANDROID)
@@ -547,6 +550,101 @@ bool AsyncHttpClient::processCompletedRequests() {
     return hadCallbacks;
 }
 
+} // namespace http
+} // namespace mystral
+
+#elif defined(MYSTRAL_HTTP_ANDROID)
+
+// Android HttpURLConnection runs off the JS/SDL thread. Only completed values
+// cross back to that thread; workers never touch an Engine or JS value.
+namespace mystral {
+namespace http {
+struct AsyncHttpClient::Impl {
+    struct Completed { AsyncHttpCallback callback; HttpResponse response; };
+    struct Job { std::thread worker; std::atomic<bool> done{false}; };
+    mutable std::mutex mutex;
+    bool initialized = false;
+    std::atomic<int> active{0};
+    std::queue<Completed> completed;
+    std::vector<std::unique_ptr<Job>> jobs;
+};
+AsyncHttpClient& AsyncHttpClient::instance() { static AsyncHttpClient client; return client; }
+AsyncHttpClient::AsyncHttpClient() : impl_(std::make_unique<Impl>()) {}
+AsyncHttpClient::~AsyncHttpClient() { shutdown(); }
+void AsyncHttpClient::init() { std::lock_guard<std::mutex> lock(impl_->mutex); impl_->initialized = true; }
+bool AsyncHttpClient::isReady() const { std::lock_guard<std::mutex> lock(impl_->mutex); return impl_->initialized; }
+void AsyncHttpClient::get(const std::string& url, AsyncHttpCallback callback, const HttpOptions& options) {
+    request("GET", url, {}, std::move(callback), options);
+}
+void AsyncHttpClient::post(const std::string& url, const std::vector<uint8_t>& body,
+                           AsyncHttpCallback callback, const HttpOptions& options) {
+    request("POST", url, body, std::move(callback), options);
+}
+void AsyncHttpClient::request(const std::string& method, const std::string& url,
+                              const std::vector<uint8_t>& body, AsyncHttpCallback callback,
+                              const HttpOptions& options) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->initialized) {
+        HttpResponse response; response.url = url; response.error = "Android async HTTP is not initialized";
+        impl_->completed.push({std::move(callback), std::move(response)});
+        return;
+    }
+    auto job = std::make_unique<Impl::Job>();
+    auto* jobPtr = job.get();
+    auto ownedCallback = std::make_shared<AsyncHttpCallback>(std::move(callback));
+    impl_->active++;
+    try {
+        impl_->jobs.reserve(impl_->jobs.size() + 1);
+        job->worker = std::thread([this, jobPtr, method, url, body, options, ownedCallback] {
+            HttpResponse response;
+            try { response = getHttpClient().request(method, url, body, options); }
+            catch (const std::exception& error) { response.url = url; response.error = error.what(); }
+            catch (...) { response.url = url; response.error = "Android HTTP worker failed"; }
+            std::lock_guard<std::mutex> lock(impl_->mutex);
+            impl_->completed.push({std::move(*ownedCallback), std::move(response)});
+            impl_->active--;
+            jobPtr->done = true;
+        });
+        impl_->jobs.push_back(std::move(job));
+    } catch (const std::exception& error) {
+        impl_->active--;
+        HttpResponse response; response.url = url; response.error = error.what();
+        impl_->completed.push({std::move(*ownedCallback), std::move(response)});
+    }
+}
+int AsyncHttpClient::activeRequestCount() const { return impl_->active.load(); }
+bool AsyncHttpClient::processCompletedRequests() {
+    std::queue<Impl::Completed> completed;
+    std::vector<std::unique_ptr<Impl::Job>> finished;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        std::swap(completed, impl_->completed);
+        auto& jobs = impl_->jobs;
+        for (auto it = jobs.begin(); it != jobs.end();) {
+            if ((*it)->done) { finished.push_back(std::move(*it)); it = jobs.erase(it); }
+            else ++it;
+        }
+    }
+    for (auto& job : finished) if (job->worker.joinable()) job->worker.join();
+    const bool hadCallbacks = !completed.empty();
+    while (!completed.empty()) {
+        auto value = std::move(completed.front()); completed.pop();
+        if (value.callback) value.callback(std::move(value.response));
+    }
+    return hadCallbacks;
+}
+void AsyncHttpClient::shutdown() {
+    std::vector<std::unique_ptr<Impl::Job>> jobs;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->initialized = false;
+        std::swap(jobs, impl_->jobs);
+    }
+    for (auto& job : jobs) if (job->worker.joinable()) job->worker.join();
+    // Runtime calls shutdown while its engine still exists, so protected JS
+    // callbacks are released by their ordinary main-thread completion path.
+    processCompletedRequests();
+}
 } // namespace http
 } // namespace mystral
 

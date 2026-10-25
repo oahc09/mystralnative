@@ -11,9 +11,13 @@
 #include <vector>
 #include <thread>
 #include <chrono>
+#include <algorithm>
 
 #ifdef _WIN32
 #include <windows.h>
+#endif
+#if defined(__ANDROID__)
+#include <android/log.h>
 #endif
 
 // stb_image_write declaration (implementation is in stb_impl.cpp)
@@ -133,6 +137,7 @@ static void onDeviceRequestEnded(WGPURequestDeviceStatus status, WGPUDevice devi
 }
 
 static void onDeviceError(WGPUDevice const* device, WGPUErrorType type, WGPUStringView message, void* userdata1, void* userdata2) {
+    mystral::webgpu::notifyUncapturedError(static_cast<int>(type), WGPU_PRINT_STRING_VIEW(message));
     const char* typeStr = "Unknown";
     switch (type) {
         case WGPUErrorType_NoError: typeStr = "NoError"; break;
@@ -144,6 +149,10 @@ static void onDeviceError(WGPUDevice const* device, WGPUErrorType type, WGPUStri
         default: break;
     }
     std::cerr << "[WebGPU] Device error (" << typeStr << "): " << WGPU_PRINT_STRING_VIEW(message) << std::endl;
+}
+
+static void onDeviceLost(WGPUDevice const* device, WGPUDeviceLostReason reason, WGPUStringView message, void*, void*) {
+    mystral::webgpu::notifyDeviceLost(static_cast<int>(reason), WGPU_PRINT_STRING_VIEW(message));
 }
 #else
 // wgpu-native callback signatures
@@ -170,6 +179,7 @@ static void onDeviceRequestEnded(WGPURequestDeviceStatus status, WGPUDevice devi
 }
 
 static void onDeviceError(WGPUErrorType type, char const* message, void* userdata) {
+    mystral::webgpu::notifyUncapturedError(static_cast<int>(type), message ? message : "");
     const char* typeStr = "Unknown";
     switch (type) {
         case WGPUErrorType_NoError: typeStr = "NoError"; break;
@@ -183,6 +193,51 @@ static void onDeviceError(WGPUErrorType type, char const* message, void* userdat
     std::cerr << "[WebGPU] Device error (" << typeStr << "): " << (message ? message : "no message") << std::endl;
 }
 #endif
+
+static std::vector<WGPUFeatureName> supportedRuntimeFeatures(WGPUAdapter adapter) {
+    std::vector<WGPUFeatureName> features;
+    for (auto feature : {WGPUFeatureName_IndirectFirstInstance, WGPUFeatureName_Float32Filterable,
+                         WGPUFeatureName_TextureCompressionBC, WGPUFeatureName_TextureCompressionETC2,
+                         WGPUFeatureName_TextureCompressionASTC}) {
+        if (wgpuAdapterHasFeature(adapter, feature)) features.push_back(feature);
+    }
+    return features;
+}
+
+static void configureDeviceCallbacks(WGPUDeviceDescriptor& descriptor) {
+    WGPUUncapturedErrorCallbackInfo errorInfo = {};
+    errorInfo.callback = onDeviceError;
+    descriptor.uncapturedErrorCallbackInfo = errorInfo;
+#if defined(MYSTRAL_WEBGPU_DAWN)
+    WGPUDeviceLostCallbackInfo lostInfo = {};
+    lostInfo.mode = WGPUCallbackMode_AllowProcessEvents;
+    lostInfo.callback = onDeviceLost;
+    descriptor.deviceLostCallbackInfo = lostInfo;
+#endif
+}
+
+static void configureAdapterBackend(WGPURequestAdapterOptions& options) {
+#if defined(__ANDROID__) && defined(MYSTRAL_WEBGPU_DAWN)
+    // Android is a Vulkan profile. Never admit Dawn's non-rendering Null backend.
+    options.backendType = WGPUBackendType_Vulkan;
+#endif
+}
+
+static bool validateAdapterBackend(const WGPUAdapterInfo& info) {
+#if defined(__ANDROID__) && defined(MYSTRAL_WEBGPU_DAWN)
+    if (info.backendType != WGPUBackendType_Vulkan) {
+        std::cerr << "[WebGPU] Android requires a real Vulkan adapter; rejected backend "
+                  << static_cast<int>(info.backendType) << std::endl;
+        return false;
+    }
+    const char* type = info.adapterType == WGPUAdapterType_CPU ? "CPU/software" :
+        info.adapterType == WGPUAdapterType_DiscreteGPU ? "discrete GPU" :
+        info.adapterType == WGPUAdapterType_IntegratedGPU ? "integrated GPU" : "unknown";
+    std::cout << "[WebGPU] Android Vulkan renderer: " << WGPU_PRINT_STRING_VIEW(info.device)
+              << "; adapter type: " << type << std::endl;
+#endif
+    return true;
+}
 
 #if defined(MYSTRAL_WEBGPU_WGPU)
 static void onWgpuLog(WGPULogLevel level, char const* message, void* userdata) {
@@ -199,34 +254,107 @@ static void onWgpuLog(WGPULogLevel level, char const* message, void* userdata) {
 }
 #endif
 
-Context::Context() = default;
+// Runtime creates and destroys contexts on its JS/SDL owner thread.
+static std::vector<Context*> g_contextOwners;
+
+Context::Context() { g_contextOwners.push_back(this); }
+
+bool releaseContextSurfaceBeforeDeviceDestroy(WGPUDevice device) {
+    for (auto* owner : g_contextOwners) {
+        if (device && owner->getDevice() == device) {
+            owner->releaseSurfaceBeforeDeviceDestroy();
+            return true;
+        }
+    }
+    return false;
+}
+
+void Context::releaseSurfaceBeforeDeviceDestroy() {
+    if (!surface_) return;
+#if defined(__ANDROID__)
+    __android_log_print(ANDROID_LOG_INFO, "MystralInterop", "EXIT_STAGE context-surface-release-enter");
+#endif
+    auto surface = surface_;
+    retireSurfaceBindings(surface);
+    // Surface destruction detaches Dawn's recycled swapchain as well as the configured one.
+    // Both can still call the device's Vulkan fenced deleter, so the device must remain alive.
+    wgpuSurfaceRelease(surface);
+    surface_ = nullptr;
+#if defined(__ANDROID__)
+    __android_log_print(ANDROID_LOG_INFO, "MystralInterop", "EXIT_STAGE context-surface-release-return");
+#endif
+}
 
 Context::~Context() {
-    // Clean up offscreen resources
+    const auto stage = [](const char* value) {
+#if defined(__ANDROID__)
+        __android_log_print(ANDROID_LOG_INFO, "MystralInterop", "EXIT_STAGE context-%s", value);
+#else
+        (void)value;
+#endif
+    };
+    stage("enter");
+    // Unconfigure alone preserves a recycled swapchain in this Dawn version.
+    releaseSurfaceBeforeDeviceDestroy();
     if (offscreenTextureView_) {
+        stage("offscreen-view-release-enter");
         wgpuTextureViewRelease((WGPUTextureView)offscreenTextureView_);
         offscreenTextureView_ = nullptr;
+        stage("offscreen-view-release-return");
     }
     if (offscreenTexture_) {
+        stage("offscreen-texture-destroy-enter");
+        wgpuTextureDestroy((WGPUTexture)offscreenTexture_);
+        stage("offscreen-texture-destroy-return");
+        stage("offscreen-texture-release-enter");
         wgpuTextureRelease((WGPUTexture)offscreenTexture_);
         offscreenTexture_ = nullptr;
+        stage("offscreen-texture-release-return");
+    }
+    // DeviceGetQueue returns an owned reference, including on the headless path.
+    if (queue_) {
+        stage("queue-release-enter");
+        wgpuQueueRelease(queue_);
+        queue_ = nullptr;
+        stage("queue-release-return");
     }
     if (device_) {
+        stage("device-destroy-enter");
+        wgpuDeviceDestroy(device_);
+        stage("device-destroy-return");
+#if defined(MYSTRAL_WEBGPU_DAWN)
+        stage("device-tick-enter");
+        wgpuDeviceTick(device_);
+        stage("device-tick-return");
+        if (instance_) {
+            stage("callbacks-drain-enter");
+            wgpuInstanceProcessEvents(instance_);
+            stage("callbacks-drain-return");
+        }
+#elif defined(MYSTRAL_WEBGPU_WGPU)
+        stage("device-poll-enter");
+        wgpuDevicePoll(device_, false, nullptr);
+        stage("device-poll-return");
+#endif
+        stage("device-release-enter");
         wgpuDeviceRelease(device_);
         device_ = nullptr;
+        stage("device-release-return");
     }
     if (adapter_) {
+        stage("adapter-release-enter");
         wgpuAdapterRelease(adapter_);
         adapter_ = nullptr;
-    }
-    if (surface_) {
-        wgpuSurfaceRelease(surface_);
-        surface_ = nullptr;
+        stage("adapter-release-return");
     }
     if (instance_) {
+        stage("instance-release-enter");
         wgpuInstanceRelease(instance_);
         instance_ = nullptr;
+        stage("instance-release-return");
     }
+    stage("return");
+    g_contextOwners.erase(std::remove(g_contextOwners.begin(), g_contextOwners.end(), this), g_contextOwners.end());
     std::cout << "[WebGPU] Context destroyed" << std::endl;
 }
 
@@ -288,6 +416,7 @@ bool Context::initializeHeadless() {
 
     // Request adapter WITHOUT a compatible surface
     WGPURequestAdapterOptions adapterOptions = {};
+    configureAdapterBackend(adapterOptions);
     adapterOptions.compatibleSurface = nullptr;  // No surface required
     adapterOptions.powerPreference = WGPUPowerPreference_HighPerformance;
 
@@ -323,6 +452,7 @@ bool Context::initializeHeadless() {
     // Print adapter info
     WGPUAdapterInfo adapterInfo = {};
     wgpuAdapterGetInfo(adapter_, &adapterInfo);
+    if (!validateAdapterBackend(adapterInfo)) { wgpuAdapterInfoFreeMembers(adapterInfo); return false; }
     std::cout << "[WebGPU] Headless adapter: " << WGPU_PRINT_STRING_VIEW(adapterInfo.device) << std::endl;
     std::cout << "[WebGPU] Backend: ";
     switch (adapterInfo.backendType) {
@@ -376,9 +506,10 @@ bool Context::initializeHeadless() {
     deviceDesc.requiredFeatures = featureCount > 0 ? requiredFeaturesWGPU : nullptr;
 #endif
 
-    WGPUUncapturedErrorCallbackInfo errorCallbackInfo = {};
-    errorCallbackInfo.callback = onDeviceError;
-    deviceDesc.uncapturedErrorCallbackInfo = errorCallbackInfo;
+    auto runtimeFeatures = supportedRuntimeFeatures(adapter_);
+    deviceDesc.requiredFeatures = runtimeFeatures.data();
+    deviceDesc.requiredFeatureCount = runtimeFeatures.size();
+    configureDeviceCallbacks(deviceDesc);
 
     DeviceRequestData deviceData;
 
@@ -543,6 +674,7 @@ bool Context::createSurface(void* nativeHandle, int platformType) {
 
     // Now request adapter with surface compatibility
     WGPURequestAdapterOptions adapterOptions = {};
+    configureAdapterBackend(adapterOptions);
     adapterOptions.compatibleSurface = surface_;
     adapterOptions.powerPreference = WGPUPowerPreference_HighPerformance;
 
@@ -582,6 +714,7 @@ bool Context::createSurface(void* nativeHandle, int platformType) {
     // Print adapter info
     WGPUAdapterInfo adapterInfo = {};
     wgpuAdapterGetInfo(adapter_, &adapterInfo);
+    if (!validateAdapterBackend(adapterInfo)) { wgpuAdapterInfoFreeMembers(adapterInfo); return false; }
     std::cout << "[WebGPU] Adapter: " << WGPU_PRINT_STRING_VIEW(adapterInfo.device) << std::endl;
     std::cout << "[WebGPU] Vendor: " << WGPU_PRINT_STRING_VIEW(adapterInfo.vendor) << std::endl;
     std::cout << "[WebGPU] Backend: ";
@@ -673,9 +806,10 @@ bool Context::createSurface(void* nativeHandle, int platformType) {
 #endif
 
     // Set up error callback
-    WGPUUncapturedErrorCallbackInfo errorCallbackInfo = {};
-    errorCallbackInfo.callback = onDeviceError;
-    deviceDesc.uncapturedErrorCallbackInfo = errorCallbackInfo;
+    auto runtimeFeatures = supportedRuntimeFeatures(adapter_);
+    deviceDesc.requiredFeatures = runtimeFeatures.data();
+    deviceDesc.requiredFeatureCount = runtimeFeatures.size();
+    configureDeviceCallbacks(deviceDesc);
 
     DeviceRequestData deviceData;
 
@@ -779,6 +913,7 @@ bool Context::createSurfaceWithDescriptor(WGPUSurfaceDescriptor& surfaceDesc) {
 
     // Now request adapter with surface compatibility
     WGPURequestAdapterOptions adapterOptions = {};
+    configureAdapterBackend(adapterOptions);
     adapterOptions.compatibleSurface = surface_;
     adapterOptions.powerPreference = WGPUPowerPreference_HighPerformance;
 
@@ -810,6 +945,7 @@ bool Context::createSurfaceWithDescriptor(WGPUSurfaceDescriptor& surfaceDesc) {
     // Print adapter info
     WGPUAdapterInfo adapterInfo = {};
     wgpuAdapterGetInfo(adapter_, &adapterInfo);
+    if (!validateAdapterBackend(adapterInfo)) { wgpuAdapterInfoFreeMembers(adapterInfo); return false; }
     std::cout << "[WebGPU] Adapter: " << WGPU_PRINT_STRING_VIEW(adapterInfo.device) << std::endl;
     std::cout << "[WebGPU] Vendor: " << WGPU_PRINT_STRING_VIEW(adapterInfo.vendor) << std::endl;
     std::cout << "[WebGPU] Backend: ";
@@ -872,9 +1008,10 @@ bool Context::createSurfaceWithDescriptor(WGPUSurfaceDescriptor& surfaceDesc) {
     deviceDesc.requiredFeatures = featureCount > 0 ? requiredFeaturesWGPU : nullptr;
 #endif
 
-    WGPUUncapturedErrorCallbackInfo errorCallbackInfo = {};
-    errorCallbackInfo.callback = onDeviceError;
-    deviceDesc.uncapturedErrorCallbackInfo = errorCallbackInfo;
+    auto runtimeFeatures = supportedRuntimeFeatures(adapter_);
+    deviceDesc.requiredFeatures = runtimeFeatures.data();
+    deviceDesc.requiredFeatureCount = runtimeFeatures.size();
+    configureDeviceCallbacks(deviceDesc);
 
     DeviceRequestData deviceData;
 

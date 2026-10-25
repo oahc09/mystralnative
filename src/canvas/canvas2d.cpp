@@ -38,7 +38,10 @@
 #if defined(__APPLE__)
 #include "include/ports/SkFontMgr_mac_ct.h"
 #elif defined(_WIN32)
-#include "include/ports/SkFontMgr_directory.h"
+#include "include/ports/SkTypeface_win.h"
+#elif defined(__ANDROID__)
+#include "include/ports/SkFontMgr_android.h"
+#include "include/ports/SkFontScanner_FreeType.h"
 #else
 #include "include/ports/SkFontMgr_fontconfig.h"
 #endif
@@ -168,7 +171,7 @@ static FontInfo parseFont(const std::string& fontStr) {
         }
         if (match[2].matched) {
             std::string weight = match[2];
-            info.bold = (weight == "bold" || std::stoi(weight) >= 700);
+            info.bold = (weight == "bold" || (weight != "normal" && std::stoi(weight) >= 700));
         }
         info.size = std::stof(match[3]);
         std::string unit = match[4];
@@ -235,6 +238,10 @@ struct Canvas2DContext::Impl {
         // Initialize font manager (platform-specific)
 #if defined(__APPLE__)
         fontMgr = SkFontMgr_New_CoreText(nullptr);
+#elif defined(_WIN32)
+        fontMgr = SkFontMgr_New_DirectWrite();
+#elif defined(__ANDROID__)
+        fontMgr = SkFontMgr_New_Android(nullptr, SkFontScanner_Make_FreeType());
 #else
         fontMgr = SkFontMgr::RefEmpty();  // Fallback
 #endif
@@ -254,10 +261,12 @@ struct Canvas2DContext::Impl {
             kPremul_SkAlphaType
         );
         surface = SkSurfaces::Raster(info);
-        if (surface) {
-            canvas = surface->getCanvas();
-            canvas->clear(SK_ColorTRANSPARENT);
-        }
+        canvas = surface ? surface->getCanvas() : nullptr;
+        if (canvas) canvas->clear(SK_ColorTRANSPARENT);
+        currentState = Canvas2DState{};
+        stateStack = {};
+        pathBuilder = SkPathBuilder();
+        updateFont();
     }
 
     SkPaint makeFillPaint() {
@@ -325,7 +334,9 @@ struct Canvas2DContext::Impl {
     void resize(int width, int height) {
         pixelWidth = width;
         pixelHeight = height;
-        pixelData.resize(width * height * 4, 0);
+        pixelData.assign(width * height * 4, 0);
+        currentState = Canvas2DState{};
+        stateStack = {};
     }
 };
 

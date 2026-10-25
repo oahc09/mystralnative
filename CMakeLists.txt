@@ -14,6 +14,7 @@ option(MYSTRAL_USE_V8 "Use V8 JavaScript engine" OFF)
 option(MYSTRAL_USE_JSC "Use JavaScriptCore engine" OFF)
 option(MYSTRAL_USE_QUICKJS "Use QuickJS engine" ON)  # Default - simplest to start
 option(MYSTRAL_USE_SWC "Enable SWC TypeScript transpiler" ON)
+option(MYSTRAL_REQUIRE_CANVAS2D "Fail configuration when Canvas 2D dependencies are unavailable" OFF)
 
 # V8 requires C++20, so use that if V8 is enabled, otherwise C++17
 # Must be after option() definitions so MYSTRAL_USE_V8 is properly set
@@ -23,7 +24,8 @@ if(MYSTRAL_USE_V8)
     # MSVC needs explicit flag for C++20 in CMAKE_CXX_FLAGS
     # (add_compile_options can be overridden by vcpkg toolchain)
     if(MSVC)
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /std:c++20")
+        # V8 validates __cplusplus; preserve UTF-8 source text on non-UTF-8 Windows hosts.
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /std:c++20 /Zc:__cplusplus /utf-8")
     endif()
 else()
     set(CMAKE_CXX_STANDARD 17)
@@ -33,8 +35,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # WebGPU Implementation (choose one)
-option(MYSTRAL_USE_DAWN "Use Dawn WebGPU implementation" ON)  # Default - best compatibility
-option(MYSTRAL_USE_WGPU "Use wgpu-native WebGPU implementation" OFF)  # Alternative - has iOS support
+if(ANDROID)
+    set(MYSTRAL_DEFAULT_DAWN OFF)
+    set(MYSTRAL_DEFAULT_WGPU ON)
+else()
+    set(MYSTRAL_DEFAULT_DAWN ON)
+    set(MYSTRAL_DEFAULT_WGPU OFF)
+endif()
+option(MYSTRAL_USE_DAWN "Use Dawn WebGPU implementation" ${MYSTRAL_DEFAULT_DAWN})
+option(MYSTRAL_USE_WGPU "Use wgpu-native WebGPU implementation" ${MYSTRAL_DEFAULT_WGPU})
 
 # Ray Tracing (optional - hardware RT via DXR/Vulkan/Metal)
 option(MYSTRAL_USE_RAYTRACING "Enable hardware ray tracing support" OFF)
@@ -58,13 +67,8 @@ elseif(WIN32)
     set(MYSTRAL_PLATFORM "windows")
 elseif(ANDROID)
     set(MYSTRAL_PLATFORM "android")
-    # Android uses QuickJS by default (simplest to integrate, no special runtime deps)
-    set(MYSTRAL_USE_V8 OFF)
+    # Keep the default QuickJS/wgpu profile while honoring explicit V8/Dawn selection.
     set(MYSTRAL_USE_JSC OFF)
-    set(MYSTRAL_USE_QUICKJS ON)
-    # wgpu-native has Android support
-    set(MYSTRAL_USE_DAWN OFF)
-    set(MYSTRAL_USE_WGPU ON)
 elseif(UNIX)
     set(MYSTRAL_PLATFORM "linux")
 endif()
@@ -78,13 +82,20 @@ message(STATUS "WebGPU: Dawn=${MYSTRAL_USE_DAWN} wgpu=${MYSTRAL_USE_WGPU}")
 # ============================================================================
 
 set(THIRD_PARTY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+set(MYSTRAL_ANDROID_DEPS_ROOT "${THIRD_PARTY_DIR}/android" CACHE PATH
+    "Android-only native dependencies, kept separate from desktop libraries")
 
 # SDL3 - Build from source as static library for single-binary distribution
 set(SDL3_DIR ${THIRD_PARTY_DIR}/sdl3)
 set(SDL3_FOUND OFF)
 
 # Find SDL3 source directory (SDL3-{version}/)
-file(GLOB SDL3_SOURCE_DIRS ${SDL3_DIR}/SDL3-*)
+if(ANDROID)
+    # The Android Java activity and native library must come from the same SDL AAR.
+    set(SDL3_SOURCE_DIRS "")
+else()
+    file(GLOB SDL3_SOURCE_DIRS ${SDL3_DIR}/SDL3-*)
+endif()
 if(SDL3_SOURCE_DIRS)
     list(GET SDL3_SOURCE_DIRS 0 SDL3_SOURCE_DIR)
     if(EXISTS ${SDL3_SOURCE_DIR}/CMakeLists.txt)
@@ -120,7 +131,11 @@ if(SDL3_SOURCE_DIRS)
 else()
     # Fallback: Check for pre-built SDL3 (Android AAR, etc.)
     if(ANDROID)
-        set(SDL3_ANDROID_DIR ${THIRD_PARTY_DIR}/sdl3-android)
+        if(EXISTS ${MYSTRAL_ANDROID_DEPS_ROOT}/sdl3/extracted)
+            set(SDL3_ANDROID_DIR ${MYSTRAL_ANDROID_DEPS_ROOT}/sdl3)
+        else()
+            set(SDL3_ANDROID_DIR ${THIRD_PARTY_DIR}/sdl3-android)
+        endif()
         if(EXISTS ${SDL3_ANDROID_DIR}/extracted)
             set(SDL3_EXTRACTED_DIR ${SDL3_ANDROID_DIR}/extracted)
             if(ANDROID_ABI STREQUAL "arm64-v8a")
@@ -140,6 +155,11 @@ else()
                 set(SDL3_LIBRARY ${SDL3_PREFAB_LIB}/libs/android.${SDL3_ANDROID_ABI}/libSDL3.so)
                 set(SDL3_INCLUDE_DIR ${SDL3_PREFAB_HEADERS}/include)
                 set(SDL3_FOUND ON)
+                add_library(SDL3::SDL3 SHARED IMPORTED)
+                set_target_properties(SDL3::SDL3 PROPERTIES
+                    IMPORTED_LOCATION "${SDL3_LIBRARY}"
+                    INTERFACE_INCLUDE_DIRECTORIES "${SDL3_INCLUDE_DIR}"
+                )
                 message(STATUS "Found SDL3 for Android: ${SDL3_LIBRARY}")
             endif()
         endif()
@@ -147,7 +167,11 @@ else()
 endif()
 
 if(NOT SDL3_FOUND)
-    message(WARNING "SDL3 not found. Run 'node scripts/download-deps.mjs' first.")
+    if(ANDROID)
+        message(FATAL_ERROR "Android requires the SDL3 AAR and matching extracted prefab library")
+    else()
+        message(WARNING "SDL3 not found. Run 'node scripts/download-deps.mjs' first.")
+    endif()
 endif()
 
 # wgpu-native
@@ -166,7 +190,11 @@ if(MYSTRAL_USE_WGPU)
             set(WGPU_TARGET_DIR ${WGPU_DIR}/device)
         endif()
     elseif(MYSTRAL_PLATFORM STREQUAL "android")
-        set(WGPU_DIR ${THIRD_PARTY_DIR}/wgpu-android)
+        if(EXISTS ${MYSTRAL_ANDROID_DEPS_ROOT}/wgpu)
+            set(WGPU_DIR ${MYSTRAL_ANDROID_DEPS_ROOT}/wgpu)
+        else()
+            set(WGPU_DIR ${THIRD_PARTY_DIR}/wgpu-android)
+        endif()
         # Determine target subdirectory based on ANDROID_ABI
         if(ANDROID_ABI STREQUAL "arm64-v8a")
             set(WGPU_TARGET_DIR ${WGPU_DIR}/aarch64)
@@ -250,7 +278,16 @@ endif()
 if(MYSTRAL_USE_DAWN)
     set(DAWN_FOUND OFF)
 
-    if(WIN32)
+    if(ANDROID)
+        set(DAWN_DIR ${MYSTRAL_ANDROID_DEPS_ROOT}/dawn)
+        set(DAWN_LIBRARY ${DAWN_DIR}/${ANDROID_ABI}/libwebgpu_dawn.a)
+        set(DAWN_INCLUDE_DIR ${DAWN_DIR}/include)
+        if(EXISTS ${DAWN_LIBRARY} AND EXISTS ${DAWN_INCLUDE_DIR}/dawn/webgpu.h)
+            set(DAWN_FOUND ON)
+        else()
+            message(FATAL_ERROR "Android Dawn requires the matching library and headers under ${DAWN_DIR}")
+        endif()
+    elseif(WIN32)
         # Windows: Look for dawn_combined.lib in the Skia build directory
         # The skia-win-static dependency from library-builder includes Dawn with full
         # D3D11/D3D12 backends, built with /MT static CRT to match Skia
@@ -446,11 +483,17 @@ endif()
 # Prebuilts from kuoruan/libv8: https://github.com/kuoruan/libv8/releases
 # See docs/V8_PREBUILTS.md for fork/update information
 if(MYSTRAL_USE_V8)
-    set(V8_DIR ${THIRD_PARTY_DIR}/v8)
+    if(ANDROID)
+        set(V8_DIR ${MYSTRAL_ANDROID_DEPS_ROOT}/v8/${ANDROID_ABI})
+    else()
+        set(V8_DIR ${THIRD_PARTY_DIR}/v8)
+    endif()
     if(EXISTS ${V8_DIR})
         # kuoruan/libv8 structure: v8/include/, v8/lib/
         # Library is libv8_monolith.a (macOS/Linux) or v8_monolith.lib (Windows)
-        if(WIN32)
+        if(ANDROID)
+            set(V8_LIB_NAME "libv8android.so")
+        elseif(WIN32)
             set(V8_LIB_NAME "v8_monolith.lib")
         else()
             set(V8_LIB_NAME "libv8_monolith.a")
@@ -471,7 +514,9 @@ if(MYSTRAL_USE_V8)
 
         # Find headers
         # kuoruan/libv8 puts headers in include/ on Linux/macOS, but at root on Windows
-        if(EXISTS ${V8_DIR}/include)
+        if(ANDROID AND EXISTS ${MYSTRAL_ANDROID_DEPS_ROOT}/v8/include/v8.h)
+            set(V8_INCLUDE_DIR ${MYSTRAL_ANDROID_DEPS_ROOT}/v8/include)
+        elseif(EXISTS ${V8_DIR}/include)
             set(V8_INCLUDE_DIR ${V8_DIR}/include)
         elseif(EXISTS ${V8_DIR}/v8.h)
             # Windows: headers are at root level
@@ -479,17 +524,27 @@ if(MYSTRAL_USE_V8)
         endif()
 
         if(V8_LIBRARY AND V8_INCLUDE_DIR)
-            add_library(v8::v8 STATIC IMPORTED)
+            if(ANDROID)
+                add_library(v8::v8 SHARED IMPORTED)
+            else()
+                add_library(v8::v8 STATIC IMPORTED)
+            endif()
             set_target_properties(v8::v8 PROPERTIES
                 IMPORTED_LOCATION ${V8_LIBRARY}
                 INTERFACE_INCLUDE_DIRECTORIES ${V8_INCLUDE_DIR}
             )
+            if(ANDROID AND (ANDROID_ABI STREQUAL "x86_64" OR ANDROID_ABI STREQUAL "arm64-v8a"))
+                # Match the fixed Android V8 producer's public tagged-pointer ABI.
+                set_property(TARGET v8::v8 APPEND PROPERTY INTERFACE_COMPILE_DEFINITIONS V8_COMPRESS_POINTERS)
+            endif()
             add_compile_definitions(MYSTRAL_JS_V8)
             message(STATUS "Found V8: ${V8_LIBRARY}")
             message(STATUS "V8 includes: ${V8_INCLUDE_DIR}")
 
             # V8 requires additional system libraries
-            if(APPLE)
+            if(ANDROID)
+                set(V8_SYSTEM_LIBS dl log)
+            elseif(APPLE)
                 # V8 on macOS needs these frameworks
                 find_library(COREFOUNDATION_FRAMEWORK CoreFoundation)
             elseif(UNIX)
@@ -511,6 +566,9 @@ if(MYSTRAL_USE_V8)
 endif()
 
 # JavaScriptCore (macOS/iOS)
+if(ANDROID AND MYSTRAL_USE_V8 AND NOT TARGET v8::v8)
+    message(FATAL_ERROR "Android V8 requires matching headers and ${ANDROID_ABI}/libv8android.so")
+endif()
 if(MYSTRAL_USE_JSC)
     if(APPLE)
         find_library(JAVASCRIPTCORE_FRAMEWORK JavaScriptCore)
@@ -622,7 +680,17 @@ endif()
 # All platforms now use olilarkin/skia-builder: https://github.com/olilarkin/skia-builder/releases
 # Structure: skia/build/include/include/core/...
 #            skia/build/{platform}-gpu/lib/Release/{arch}/libskia.a
-if(MYSTRAL_PLATFORM STREQUAL "ios")
+if(ANDROID)
+    set(SKIA_DIR ${MYSTRAL_ANDROID_DEPS_ROOT}/skia)
+    set(SKIA_TARGET_DIR ${SKIA_DIR}/${ANDROID_ABI})
+    if(ANDROID_ABI STREQUAL "x86_64")
+        set(SKIA_ANDROID_ARCH "x64")
+    elseif(ANDROID_ABI STREQUAL "arm64-v8a")
+        set(SKIA_ANDROID_ARCH "arm64")
+    else()
+        message(FATAL_ERROR "The Android Skia profile supports x86_64 and arm64-v8a")
+    endif()
+elseif(MYSTRAL_PLATFORM STREQUAL "ios")
     set(SKIA_DIR ${THIRD_PARTY_DIR}/skia-ios)
     # iOS Skia structure: skia-ios/{device,simulator}/build/...
     if(CMAKE_OSX_SYSROOT MATCHES "simulator")
@@ -670,12 +738,17 @@ if(EXISTS ${SKIA_TARGET_DIR})
     # olilarkin/skia-builder structure (used for all platforms now)
     # Headers: build/include/include/core/...
     # Library: build/{platform}-gpu/lib/Release/{arch}/libskia.a
-    if(EXISTS ${SKIA_TARGET_DIR}/build/include/include)
+    if(ANDROID AND EXISTS ${SKIA_TARGET_DIR}/include/core/SkCanvas.h)
+        set(SKIA_INCLUDE_DIR ${SKIA_TARGET_DIR})
+    elseif(EXISTS ${SKIA_TARGET_DIR}/build/include/include)
         set(SKIA_INCLUDE_DIR ${SKIA_TARGET_DIR}/build/include)
     endif()
 
     # Find library
-    if(WIN32)
+    if(ANDROID)
+        set(SKIA_ANDROID_LIB_DIR ${SKIA_TARGET_DIR}/out/Release-android-${SKIA_ANDROID_ARCH})
+        set(SKIA_LIB_PATH ${SKIA_ANDROID_LIB_DIR}/libskia.a)
+    elseif(WIN32)
         set(SKIA_LIB_PATH ${SKIA_TARGET_DIR}/build/${SKIA_PLATFORM_DIR}/lib/Release/${SKIA_LIB_SUBDIR}/skia.lib)
     else()
         set(SKIA_LIB_PATH ${SKIA_TARGET_DIR}/build/${SKIA_PLATFORM_DIR}/lib/Release/${SKIA_LIB_SUBDIR}/libskia.a)
@@ -691,6 +764,14 @@ if(EXISTS ${SKIA_TARGET_DIR})
             IMPORTED_LOCATION ${SKIA_LIBRARY}
             INTERFACE_INCLUDE_DIRECTORIES ${SKIA_INCLUDE_DIR}
         )
+        if(ANDROID)
+            # The maintained Android kit ships its codec/font dependencies as separate archives.
+            # A linker group resolves their mutual references without requiring shared desktop libs.
+            file(GLOB SKIA_ANDROID_ARCHIVES ${SKIA_ANDROID_LIB_DIR}/*.a)
+            set_property(TARGET skia::skia APPEND PROPERTY INTERFACE_LINK_LIBRARIES
+                "-Wl,--start-group" ${SKIA_ANDROID_ARCHIVES} "-Wl,--end-group" android log z
+            )
+        endif()
         add_compile_definitions(MYSTRAL_HAS_SKIA)
         message(STATUS "Found Skia: ${SKIA_LIBRARY}")
         message(STATUS "Skia includes: ${SKIA_INCLUDE_DIR}")
@@ -708,6 +789,9 @@ else()
 endif()
 
 # SWC (TypeScript transpiler)
+if(MYSTRAL_REQUIRE_CANVAS2D AND NOT TARGET skia::skia)
+    message(FATAL_ERROR "The selected profile requires a real Skia Canvas 2D implementation")
+endif()
 # Prebuilt layout: swc/include/swc.h and swc/lib/libswc.a (or swc.lib on Windows)
 set(SWC_DIR ${THIRD_PARTY_DIR}/swc)
 if(MYSTRAL_USE_SWC AND EXISTS ${SWC_DIR} AND NOT IOS AND NOT ANDROID)
@@ -1114,8 +1198,10 @@ elseif(WIN32)
         mfreadwrite.lib
         RuntimeObject.lib
     )
-    # C++/WinRT needs /await for coroutine support
-    target_compile_options(mystral-runtime PRIVATE /await)
+    # C++20 provides standard coroutines; /await selects the removed experimental ABI.
+    if(CMAKE_CXX_STANDARD LESS 20)
+        target_compile_options(mystral-runtime PRIVATE /await:strict)
+    endif()
 elseif(ANDROID)
     target_sources(mystral-runtime PRIVATE
         src/platform/surface_android.cpp
@@ -1224,7 +1310,7 @@ if(MYSTRAL_USE_DAWN AND TARGET dawn::webgpu)
         if(MYSTRAL_USE_V8)
             target_link_options(mystral-runtime PUBLIC "/FORCE:MULTIPLE")
         endif()
-    elseif(UNIX)
+    elseif(UNIX AND NOT ANDROID)
         # Dawn and V8 both include Abseil library, causing multiple definition errors.
         # Allow multiple definitions to resolve this conflict.
         if(MYSTRAL_USE_V8)
@@ -1306,6 +1392,10 @@ endif()
 # Skia linkage (optional - for Canvas 2D support)
 if(TARGET skia::skia)
     target_link_libraries(mystral-runtime PRIVATE skia::skia)
+    if(WIN32)
+        # Resolve the system-font backend used by SkFontMgr_New_DirectWrite.
+        target_link_libraries(mystral-runtime PRIVATE dwrite.lib)
+    endif()
 endif()
 
 # SWC linkage (TypeScript transpiler)

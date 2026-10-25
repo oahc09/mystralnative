@@ -24,15 +24,15 @@
         android:label="@string/app_name"
         android:supportsRtl="true"
         android:theme="@style/Theme.MystralNative"
+        android:networkSecurityConfig="@xml/interop_network_security"
         android:hasCode="true">
 
         <!-- Main SDL Activity -->
         <activity
-            android:name=".MystralActivity"
+            android:name="com.mystral.engine.MystralActivity"
             android:configChanges="keyboard|keyboardHidden|orientation|screenSize|screenLayout|navigation|uiMode|density"
             android:exported="true"
-            android:hardwareAccelerated="true"
-            android:screenOrientation="landscape">
+            android:hardwareAccelerated="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

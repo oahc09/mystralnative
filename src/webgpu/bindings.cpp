@@ -26,6 +26,11 @@
 #include <fstream>
 #include <thread>
 #include <chrono>
+#include <mutex>
+#include <deque>
+#include <algorithm>
+#include <cmath>
+#include "mystral/webgpu/context.h"
 
 // stb_image for image loading (implementation in stb_impl.cpp)
 #include "stb_image.h"
@@ -89,6 +94,434 @@ static WGPUQueue g_queue = nullptr;
 static WGPUSurface g_surface = nullptr;
 static WGPUInstance g_instance = nullptr;
 static js::Engine* g_engine = nullptr;
+static WGPUAdapter g_adapter = nullptr;
+static js::JSValueHandle g_jsDevice;
+static bool g_deviceDestroyed = false;
+
+struct DeferredResult {
+    js::JSValueHandle promise, resolve, reject;
+    bool settled = false;
+};
+struct CompilationMessage {
+    std::string message, type;
+    uint64_t lineNum, linePos, offset, length;
+};
+struct NativeCompletion {
+    enum Kind { Error, Lost, Scope, Queue, Compilation } kind;
+    std::shared_ptr<DeferredResult> deferred;
+    bool success = true;
+    int type = 0;
+    std::string message;
+    std::vector<CompilationMessage> compilation;
+};
+static std::mutex g_completionMutex;
+static std::deque<NativeCompletion> g_completions;
+static std::vector<std::weak_ptr<DeferredResult>> g_deferredResults;
+static std::shared_ptr<DeferredResult> g_lostResult;
+
+#if defined(MYSTRAL_WEBGPU_DAWN)
+static std::string copyNativeString(WGPUStringView value) {
+    if (!value.data) return {};
+    return std::string(value.data, value.length == WGPU_STRLEN ? std::strlen(value.data) : value.length);
+}
+#else
+static std::string copyNativeString(const char* value) { return value ? value : ""; }
+#endif
+
+static std::shared_ptr<DeferredResult> makeDeferred() {
+    auto holder = g_engine->evalScriptWithResult(
+        "(() => { let resolve, reject; const promise = new Promise((a,b) => {resolve=a; reject=b;});"
+        "return {promise, resolve, reject}; })()", "<WebGPU promise>");
+    auto result = std::make_shared<DeferredResult>();
+    result->promise = g_engine->getProperty(holder, "promise");
+    result->resolve = g_engine->getProperty(holder, "resolve");
+    result->reject = g_engine->getProperty(holder, "reject");
+    g_engine->protect(result->resolve);
+    g_engine->protect(result->reject);
+    g_deferredResults.push_back(result);
+    return result;
+}
+
+static js::JSValueHandle nativeError(int type, const std::string& message) {
+    auto error = g_engine->call(g_engine->getGlobalProperty("Error"), g_engine->newUndefined(),
+                                {g_engine->newString(message.c_str())});
+    const char* name = type == WGPUErrorType_Validation ? "GPUValidationError" :
+        type == WGPUErrorType_OutOfMemory ? "GPUOutOfMemoryError" : "GPUInternalError";
+    g_engine->setProperty(error, "name", g_engine->newString(name));
+    return error;
+}
+
+static void settle(const std::shared_ptr<DeferredResult>& deferred, bool success, js::JSValueHandle value) {
+    if (!g_engine || !deferred || deferred->settled) return;
+    deferred->settled = true;
+    g_engine->call(success ? deferred->resolve : deferred->reject, g_engine->newUndefined(), {value});
+    g_engine->unprotect(deferred->resolve);
+    g_engine->unprotect(deferred->reject);
+}
+
+static js::JSValueHandle rejected(const std::string& message) {
+    auto deferred = makeDeferred();
+    settle(deferred, false, nativeError(WGPUErrorType_Validation, message));
+    return deferred->promise;
+}
+
+static js::JSValueHandle resolved(js::JSValueHandle value) {
+    auto deferred = makeDeferred();
+    settle(deferred, true, value);
+    return deferred->promise;
+}
+
+static void enqueue(NativeCompletion completion) {
+    std::lock_guard<std::mutex> lock(g_completionMutex);
+    g_completions.push_back(std::move(completion));
+}
+
+void notifyUncapturedError(int type, const std::string& message) {
+    NativeCompletion completion{NativeCompletion::Error};
+    completion.type = type;
+    completion.message = message;
+    enqueue(std::move(completion));
+}
+
+void notifyDeviceLost(int reason, const std::string& message) {
+    NativeCompletion completion{NativeCompletion::Lost};
+    completion.type = reason;
+    completion.message = message;
+    enqueue(std::move(completion));
+}
+
+#if defined(MYSTRAL_WEBGPU_DAWN)
+static void onScopeCompleted(WGPUPopErrorScopeStatus status, WGPUErrorType type, WGPUStringView message, void* userdata, void*) {
+    std::unique_ptr<std::shared_ptr<DeferredResult>> owner(static_cast<std::shared_ptr<DeferredResult>*>(userdata));
+    NativeCompletion completion{NativeCompletion::Scope};
+    completion.deferred = *owner;
+    completion.success = status == WGPUPopErrorScopeStatus_Success;
+    completion.type = type;
+    completion.message = copyNativeString(message);
+    enqueue(std::move(completion));
+}
+
+static void onQueueCompleted(WGPUQueueWorkDoneStatus status, WGPUStringView message, void* userdata, void*) {
+    std::unique_ptr<std::shared_ptr<DeferredResult>> owner(static_cast<std::shared_ptr<DeferredResult>*>(userdata));
+    NativeCompletion completion{NativeCompletion::Queue};
+    completion.deferred = *owner;
+    completion.success = status == WGPUQueueWorkDoneStatus_Success;
+    completion.message = copyNativeString(message);
+    enqueue(std::move(completion));
+}
+
+static void onCompilationCompleted(WGPUCompilationInfoRequestStatus status, const WGPUCompilationInfo* info, void* userdata, void*) {
+    std::unique_ptr<std::shared_ptr<DeferredResult>> owner(static_cast<std::shared_ptr<DeferredResult>*>(userdata));
+    NativeCompletion completion{NativeCompletion::Compilation};
+    completion.deferred = *owner;
+    completion.success = status == WGPUCompilationInfoRequestStatus_Success && info;
+    completion.message = "Native shader compilation information request failed";
+    if (info) for (size_t i = 0; i < info->messageCount; ++i) {
+        const auto& entry = info->messages[i];
+        completion.compilation.push_back({copyNativeString(entry.message),
+            entry.type == WGPUCompilationMessageType_Error ? "error" :
+            entry.type == WGPUCompilationMessageType_Warning ? "warning" : "info",
+            entry.lineNum, entry.linePos, entry.offset, entry.length});
+    }
+    enqueue(std::move(completion));
+}
+#endif
+
+void processDeviceCallbacks() {
+    if (!g_engine) return;
+#if defined(MYSTRAL_WEBGPU_DAWN)
+    if (g_device) wgpuDeviceTick(g_device);
+    if (g_instance) wgpuInstanceProcessEvents(g_instance);
+#elif defined(MYSTRAL_WEBGPU_WGPU)
+    if (g_device) wgpuDevicePoll(g_device, false, nullptr);
+#endif
+    std::deque<NativeCompletion> pending;
+    {
+        std::lock_guard<std::mutex> lock(g_completionMutex);
+        pending.swap(g_completions);
+    }
+    for (auto& completion : pending) {
+        if (completion.kind == NativeCompletion::Error) {
+            if (!g_jsDevice.ptr) continue;
+            auto event = g_engine->evalScriptWithResult("new Event('uncapturederror', {cancelable:true})", "<WebGPU error event>");
+            g_engine->setProperty(event, "error", nativeError(completion.type, completion.message));
+            auto dispatch = g_engine->getProperty(g_jsDevice, "dispatchEvent");
+            g_engine->call(dispatch, g_jsDevice, {event});
+        } else if (completion.kind == NativeCompletion::Lost) {
+            auto info = g_engine->newObject();
+            g_engine->setProperty(info, "reason", g_engine->newString(
+                completion.type == WGPUDeviceLostReason_Destroyed ? "destroyed" : "unknown"));
+            g_engine->setProperty(info, "message", g_engine->newString(completion.message.c_str()));
+            settle(g_lostResult, true, info);
+        } else if (!completion.success) {
+            settle(completion.deferred, false, nativeError(completion.type, completion.message));
+        } else if (completion.kind == NativeCompletion::Scope) {
+            settle(completion.deferred, true, completion.type == WGPUErrorType_NoError ? g_engine->newNull() :
+                nativeError(completion.type, completion.message));
+        } else if (completion.kind == NativeCompletion::Compilation) {
+            auto info = g_engine->newObject();
+            auto messages = g_engine->newArray(completion.compilation.size());
+            for (size_t i = 0; i < completion.compilation.size(); ++i) {
+                const auto& entry = completion.compilation[i];
+                auto message = g_engine->newObject();
+                g_engine->setProperty(message, "message", g_engine->newString(entry.message.c_str()));
+                g_engine->setProperty(message, "type", g_engine->newString(entry.type.c_str()));
+                g_engine->setProperty(message, "lineNum", g_engine->newNumber(entry.lineNum));
+                g_engine->setProperty(message, "linePos", g_engine->newNumber(entry.linePos));
+                g_engine->setProperty(message, "offset", g_engine->newNumber(entry.offset));
+                g_engine->setProperty(message, "length", g_engine->newNumber(entry.length));
+                g_engine->setPropertyIndex(messages, i, message);
+            }
+            g_engine->setProperty(info, "messages", messages);
+            settle(completion.deferred, true, info);
+        } else {
+            settle(completion.deferred, true, g_engine->newUndefined());
+        }
+    }
+    g_deferredResults.erase(std::remove_if(g_deferredResults.begin(), g_deferredResults.end(),
+        [](const auto& value) { return value.expired(); }), g_deferredResults.end());
+}
+
+void cleanupDeviceBindings() {
+    if (!g_engine) return;
+    for (auto& weak : g_deferredResults) if (auto deferred = weak.lock()) {
+        if (!deferred->settled) {
+            deferred->settled = true;
+            g_engine->unprotect(deferred->resolve);
+            g_engine->unprotect(deferred->reject);
+        }
+    }
+    if (g_jsDevice.ptr) g_engine->unprotect(g_jsDevice);
+    g_jsDevice = {};
+    g_lostResult.reset();
+    g_deferredResults.clear();
+    g_engine = nullptr;
+    std::lock_guard<std::mutex> lock(g_completionMutex);
+    g_completions.clear();
+}
+
+static js::JSValueHandle nativeLimits(bool adapter) {
+#if defined(MYSTRAL_WEBGPU_DAWN)
+    WGPULimits limits = {};
+    const auto status = adapter ? wgpuAdapterGetLimits(g_adapter, &limits) : wgpuDeviceGetLimits(g_device, &limits);
+    if (status != WGPUStatus_Success) {
+        g_engine->throwException("Native WebGPU limits query failed");
+        return g_engine->newUndefined();
+    }
+#else
+    WGPUSupportedLimits supported = {};
+    if (!(adapter ? wgpuAdapterGetLimits(g_adapter, &supported) : wgpuDeviceGetLimits(g_device, &supported))) {
+        g_engine->throwException("Native WebGPU limits query failed");
+        return g_engine->newUndefined();
+    }
+    const auto& limits = supported.limits;
+#endif
+    auto object = g_engine->newObject();
+#define EXPOSE_LIMIT(name) g_engine->setProperty(object, #name, g_engine->newNumber(static_cast<double>(limits.name)))
+    EXPOSE_LIMIT(maxTextureDimension1D); EXPOSE_LIMIT(maxTextureDimension2D); EXPOSE_LIMIT(maxTextureDimension3D);
+    EXPOSE_LIMIT(maxTextureArrayLayers); EXPOSE_LIMIT(maxBindGroups); EXPOSE_LIMIT(maxBindingsPerBindGroup);
+    EXPOSE_LIMIT(maxDynamicUniformBuffersPerPipelineLayout); EXPOSE_LIMIT(maxDynamicStorageBuffersPerPipelineLayout);
+    EXPOSE_LIMIT(maxSampledTexturesPerShaderStage); EXPOSE_LIMIT(maxSamplersPerShaderStage);
+    EXPOSE_LIMIT(maxStorageBuffersPerShaderStage); EXPOSE_LIMIT(maxStorageTexturesPerShaderStage);
+    EXPOSE_LIMIT(maxUniformBuffersPerShaderStage); EXPOSE_LIMIT(maxUniformBufferBindingSize);
+    EXPOSE_LIMIT(maxStorageBufferBindingSize); EXPOSE_LIMIT(minUniformBufferOffsetAlignment);
+    EXPOSE_LIMIT(minStorageBufferOffsetAlignment); EXPOSE_LIMIT(maxVertexBuffers); EXPOSE_LIMIT(maxBufferSize);
+    EXPOSE_LIMIT(maxVertexAttributes); EXPOSE_LIMIT(maxVertexBufferArrayStride); EXPOSE_LIMIT(maxColorAttachments);
+    EXPOSE_LIMIT(maxColorAttachmentBytesPerSample); EXPOSE_LIMIT(maxComputeWorkgroupStorageSize);
+    EXPOSE_LIMIT(maxComputeInvocationsPerWorkgroup); EXPOSE_LIMIT(maxComputeWorkgroupSizeX);
+    EXPOSE_LIMIT(maxComputeWorkgroupSizeY); EXPOSE_LIMIT(maxComputeWorkgroupSizeZ); EXPOSE_LIMIT(maxComputeWorkgroupsPerDimension);
+#undef EXPOSE_LIMIT
+    return object;
+}
+
+struct NamedFeature { const char* name; WGPUFeatureName native; };
+static const NamedFeature kFeatures[] = {
+    {"indirect-first-instance", WGPUFeatureName_IndirectFirstInstance},
+    {"float32-filterable", WGPUFeatureName_Float32Filterable},
+    {"texture-compression-bc", WGPUFeatureName_TextureCompressionBC},
+    {"texture-compression-etc2", WGPUFeatureName_TextureCompressionETC2},
+    {"texture-compression-astc", WGPUFeatureName_TextureCompressionASTC},
+    {"depth-clip-control", WGPUFeatureName_DepthClipControl},
+    {"depth32float-stencil8", WGPUFeatureName_Depth32FloatStencil8},
+    {"timestamp-query", WGPUFeatureName_TimestampQuery},
+    {"shader-f16", WGPUFeatureName_ShaderF16},
+};
+
+static js::JSValueHandle nativeFeatures(bool adapter) {
+    auto set = g_engine->evalScriptWithResult("new Set()", "<WebGPU features>");
+    auto add = g_engine->getProperty(set, "add");
+    for (const auto& feature : kFeatures) {
+        const bool enabled = adapter ? wgpuAdapterHasFeature(g_adapter, feature.native) : wgpuDeviceHasFeature(g_device, feature.native);
+        if (enabled) g_engine->call(add, set, {g_engine->newString(feature.name)});
+    }
+    return set;
+}
+
+static std::string validateDeviceRequest(const std::vector<js::JSValueHandle>& args) {
+    if (g_deviceDestroyed) return "Native GPUDevice was destroyed";
+    if (args.empty()) return "";
+    auto descriptor = args[0];
+    auto requiredLimits = g_engine->getProperty(descriptor, "requiredLimits");
+    if (!g_engine->isUndefined(requiredLimits)) {
+        auto keysFunction = g_engine->getProperty(g_engine->getGlobalProperty("Object"), "keys");
+        auto keys = g_engine->call(keysFunction, g_engine->newUndefined(), {requiredLimits});
+        const auto count = static_cast<uint32_t>(g_engine->toNumber(g_engine->getProperty(keys, "length")));
+        auto available = nativeLimits(false);
+        for (uint32_t i = 0; i < count; ++i) {
+            auto name = g_engine->toString(g_engine->getPropertyIndex(keys, i));
+            auto supported = g_engine->getProperty(available, name.c_str());
+            const double required = g_engine->toNumber(g_engine->getProperty(requiredLimits, name.c_str()));
+            const double actual = g_engine->toNumber(supported);
+            const bool alignment = name == "minUniformBufferOffsetAlignment" || name == "minStorageBufferOffsetAlignment";
+            if (g_engine->isUndefined(supported) || !std::isfinite(required) || required < 0 || std::floor(required) != required ||
+                (alignment ? actual > required : actual < required)) return "Unsupported required WebGPU limit: " + name;
+        }
+    }
+    auto requiredFeatures = g_engine->getProperty(descriptor, "requiredFeatures");
+    if (!g_engine->isUndefined(requiredFeatures)) {
+        const auto count = static_cast<uint32_t>(g_engine->toNumber(g_engine->getProperty(requiredFeatures, "length")));
+        for (uint32_t i = 0; i < count; ++i) {
+            auto name = g_engine->toString(g_engine->getPropertyIndex(requiredFeatures, i));
+            bool enabled = false;
+            for (const auto& feature : kFeatures) if (name == feature.name)
+                enabled = wgpuDeviceHasFeature(g_device, feature.native);
+            if (!enabled) return "Required feature is not enabled on native device: " + name;
+        }
+    }
+    return "";
+}
+
+static bool copyUnsigned(js::JSValueHandle value, uint64_t fallback, bool wide, uint64_t& output) {
+    if (g_engine->isUndefined(value)) {
+        output = fallback;
+        return true;
+    }
+    const double number = std::trunc(g_engine->toNumber(value));
+    if (!std::isfinite(number) || number < 0 || number >= (wide ? 18446744073709551616.0 : 4294967296.0)) {
+        g_engine->throwException("WebGPU field is outside its unsigned integer range");
+        return false;
+    }
+    output = static_cast<uint64_t>(number);
+    return true;
+}
+
+static bool copyLayout(js::JSValueHandle descriptor, WGPUTextureDataLayout_Compat& layout) {
+    uint64_t offset, bytesPerRow, rowsPerImage;
+    if (!copyUnsigned(g_engine->getProperty(descriptor, "offset"), 0, true, offset) ||
+        !copyUnsigned(g_engine->getProperty(descriptor, "bytesPerRow"), WGPU_COPY_STRIDE_UNDEFINED, false, bytesPerRow) ||
+        !copyUnsigned(g_engine->getProperty(descriptor, "rowsPerImage"), WGPU_COPY_STRIDE_UNDEFINED, false, rowsPerImage)) return false;
+    layout.offset = offset;
+    layout.bytesPerRow = static_cast<uint32_t>(bytesPerRow);
+    layout.rowsPerImage = static_cast<uint32_t>(rowsPerImage);
+    return true;
+}
+
+static bool copyExtent(js::JSValueHandle value, WGPUExtent3D& extent) {
+    const auto length = g_engine->getProperty(value, "length");
+    const bool sequence = !g_engine->isUndefined(length);
+    if (sequence) {
+        const double count = g_engine->toNumber(length);
+        if (count < 1 || count > 3) {
+            g_engine->throwException("Texture copy extent sequence requires one to three coordinates");
+            return false;
+        }
+    }
+    auto width = sequence ? g_engine->getPropertyIndex(value, 0) : g_engine->getProperty(value, "width");
+    if (g_engine->isUndefined(width)) {
+        g_engine->throwException("Texture copy extent requires width");
+        return false;
+    }
+    uint64_t w, h, d;
+    if (!copyUnsigned(width, 0, false, w) ||
+        !copyUnsigned(sequence ? g_engine->getPropertyIndex(value, 1) : g_engine->getProperty(value, "height"), 1, false, h) ||
+        !copyUnsigned(sequence ? g_engine->getPropertyIndex(value, 2) : g_engine->getProperty(value, "depthOrArrayLayers"), 1, false, d)) return false;
+    extent = {static_cast<uint32_t>(w), static_cast<uint32_t>(h), static_cast<uint32_t>(d)};
+    return true;
+}
+
+static bool copyTexture(js::JSValueHandle value, WGPUImageCopyTexture_Compat& texture) {
+    texture.texture = static_cast<WGPUTexture>(g_engine->getPrivateData(g_engine->getProperty(value, "texture")));
+    uint64_t mip;
+    if (!copyUnsigned(g_engine->getProperty(value, "mipLevel"), 0, false, mip)) return false;
+    texture.mipLevel = static_cast<uint32_t>(mip);
+    texture.origin = {0, 0, 0};
+    auto origin = g_engine->getProperty(value, "origin");
+    if (!g_engine->isUndefined(origin)) {
+        const bool sequence = !g_engine->isUndefined(g_engine->getProperty(origin, "length"));
+        uint64_t x, y, z;
+        if (!copyUnsigned(sequence ? g_engine->getPropertyIndex(origin, 0) : g_engine->getProperty(origin, "x"), 0, false, x) ||
+            !copyUnsigned(sequence ? g_engine->getPropertyIndex(origin, 1) : g_engine->getProperty(origin, "y"), 0, false, y) ||
+            !copyUnsigned(sequence ? g_engine->getPropertyIndex(origin, 2) : g_engine->getProperty(origin, "z"), 0, false, z)) return false;
+        texture.origin = {static_cast<uint32_t>(x), static_cast<uint32_t>(y), static_cast<uint32_t>(z)};
+    }
+    texture.aspect = WGPUTextureAspect_All;
+    auto aspect = g_engine->getProperty(value, "aspect");
+    if (!g_engine->isUndefined(aspect)) {
+        const auto name = g_engine->toString(aspect);
+        if (name == "depth-only") texture.aspect = WGPUTextureAspect_DepthOnly;
+        else if (name == "stencil-only") texture.aspect = WGPUTextureAspect_StencilOnly;
+        else if (name != "all") {
+            g_engine->throwException("Invalid texture copy aspect");
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool sequenceArray(js::JSValueHandle value, js::JSValueHandle& array) {
+    auto convert = g_engine->evalScriptWithResult(
+        "(value => { if (value == null || typeof value[Symbol.iterator] !== 'function') "
+        "throw new TypeError('WebGPU sequence requires an iterable'); return Array.from(value); })",
+        "<WebGPU sequence conversion>");
+    array = g_engine->call(convert, g_engine->newUndefined(), {value});
+    return !g_engine->hasException();
+}
+
+static bool dynamicOffsets(const std::vector<js::JSValueHandle>& args, std::vector<uint32_t>& offsets) {
+    if (args.size() <= 2 || g_engine->isUndefined(args[2])) return true;
+    js::JSValueHandle array;
+    if (!sequenceArray(args[2], array)) return false;
+    const auto count = static_cast<uint64_t>(g_engine->toNumber(g_engine->getProperty(array, "length")));
+    uint64_t start = 0, length = count;
+    if (args.size() > 3 && !copyUnsigned(args[3], 0, true, start)) return false;
+    if (start > count) {
+        g_engine->throwException("Dynamic offset start exceeds the provided array");
+        return false;
+    }
+    length = count - start;
+    if (args.size() > 4 && !copyUnsigned(args[4], length, false, length)) return false;
+    if (length > count - start) {
+        g_engine->throwException("Dynamic offset range exceeds the provided array");
+        return false;
+    }
+    offsets.reserve(static_cast<size_t>(length));
+    for (uint64_t i = 0; i < length; ++i) {
+        uint64_t offset;
+        if (!copyUnsigned(g_engine->getPropertyIndex(array, static_cast<uint32_t>(start + i)), 0, false, offset)) return false;
+        offsets.push_back(static_cast<uint32_t>(offset));
+    }
+    return true;
+}
+
+static bool renderPassLoadOp(js::JSValueHandle value, WGPULoadOp& output) {
+    output = WGPULoadOp_Undefined;
+    if (g_engine->isUndefined(value)) return true;
+    const auto name = g_engine->toString(value);
+    if (name == "clear") output = WGPULoadOp_Clear;
+    else if (name == "load") output = WGPULoadOp_Load;
+    else { g_engine->throwException("Invalid render pass load operation"); return false; }
+    return true;
+}
+
+static bool renderPassStoreOp(js::JSValueHandle value, WGPUStoreOp& output) {
+    output = WGPUStoreOp_Undefined;
+    if (g_engine->isUndefined(value)) return true;
+    const auto name = g_engine->toString(value);
+    if (name == "store") output = WGPUStoreOp_Store;
+    else if (name == "discard") output = WGPUStoreOp_Discard;
+    else { g_engine->throwException("Invalid render pass store operation"); return false; }
+    return true;
+}
 
 // Offscreen rendering support (for no-SDL mode)
 static WGPUTexture g_offscreenTexture = nullptr;
@@ -345,10 +778,23 @@ static WGPUTexture getCurrentSwapchainTexture() {
 #endif
 }
 
+void retireSurfaceBindings(WGPUSurface surface) {
+    if (g_surface != surface) return;
+    g_contextConfigured = false;
+    g_surface = nullptr;
+    if (g_currentTextureView) {
+        wgpuTextureViewRelease(g_currentTextureView);
+        g_currentTextureView = nullptr;
+    }
+    // The texture registry owns the texture's API reference; these are only frame aliases.
+    g_currentTexture = nullptr;
+    g_currentViewSourceTexture = nullptr;
+}
+
 /**
  * Initialize WebGPU bindings in the JS engine
  */
-bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void* wgpuQueue, void* wgpuSurface, uint32_t surfaceFormat, uint32_t width, uint32_t height, bool debug) {
+bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void* wgpuQueue, void* wgpuSurface, uint32_t surfaceFormat, uint32_t width, uint32_t height, bool debug, void* wgpuAdapter) {
     if (!engine) {
         std::cerr << "[WebGPU] No JS engine provided for bindings" << std::endl;
         return false;
@@ -363,6 +809,8 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
     g_device = (WGPUDevice)wgpuDevice;
     g_queue = (WGPUQueue)wgpuQueue;
     g_surface = (WGPUSurface)wgpuSurface;
+    g_adapter = (WGPUAdapter)wgpuAdapter;
+    g_deviceDestroyed = false;
 
     // Set canvas dimensions from window size
     g_canvasWidth = width;
@@ -456,8 +904,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
             // Create GPUCanvasContext
             auto canvasContext = g_engine->newObject();
 
-            // Store reference to our surface
-            g_engine->setPrivateData(canvasContext, g_surface);
+            // Methods consult the live Context-owned surface, never a stale borrowed private pointer.
 
             // context.canvas - reference back to canvas
             auto canvas = g_engine->getGlobalProperty("canvas");
@@ -466,6 +913,10 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
             // context.configure({ device, format, alphaMode })
             g_engine->setProperty(canvasContext, "configure",
                 g_engine->newFunction("configure", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                    if (g_deviceDestroyed) {
+                        g_engine->throwException("The single-device Runtime is destroyed; create a new Runtime");
+                        return g_engine->newUndefined();
+                    }
                     if (args.empty()) {
                         g_engine->throwException("configure requires a descriptor");
                         return g_engine->newUndefined();
@@ -476,7 +927,32 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                     // Get format
                     std::string format = g_engine->toString(g_engine->getProperty(descriptor, "format"));
                     g_surfaceFormat = stringToFormat(format);
-                    // Note: alphaMode and device are stored but surface is already configured
+                    auto canvas = g_engine->getGlobalProperty("canvas");
+                    auto width = g_engine->toNumber(g_engine->getProperty(canvas, "width"));
+                    auto height = g_engine->toNumber(g_engine->getProperty(canvas, "height"));
+                    auto configuredDevice = g_engine->getProperty(descriptor, "device");
+                    if (!std::isfinite(width) || !std::isfinite(height) || width <= 0 || height <= 0 ||
+                        g_engine->getPrivateData(configuredDevice) != g_device) {
+                        g_engine->throwException("Invalid WebGPU canvas dimensions or device");
+                        return g_engine->newUndefined();
+                    }
+                    g_canvasWidth = static_cast<uint32_t>(width);
+                    g_canvasHeight = static_cast<uint32_t>(height);
+                    if (g_surface) {
+                        WGPUSurfaceConfiguration configuration = {};
+                        configuration.device = g_device;
+                        configuration.format = g_surfaceFormat;
+                        configuration.width = g_canvasWidth;
+                        configuration.height = g_canvasHeight;
+                        auto usage = g_engine->getProperty(descriptor, "usage");
+                        configuration.usage = g_engine->isUndefined(usage) ? WGPUTextureUsage_RenderAttachment :
+                            static_cast<WGPUTextureUsage>(static_cast<uint64_t>(g_engine->toNumber(usage)));
+                        // Retain native screenshot support without confusing it with external presentation evidence.
+                        configuration.usage |= WGPUTextureUsage_CopySrc;
+                        configuration.alphaMode = WGPUCompositeAlphaMode_Auto;
+                        configuration.presentMode = WGPUPresentMode_Fifo;
+                        wgpuSurfaceConfigure(g_surface, &configuration);
+                    }
 
                     g_contextConfigured = true;
                     if (g_verboseLogging) std::cout << "[Canvas] Context configured with format: " << format << std::endl;
@@ -489,6 +965,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
             g_engine->setProperty(canvasContext, "unconfigure",
                 g_engine->newFunction("unconfigure", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
                     g_contextConfigured = false;
+                    if (g_surface) wgpuSurfaceUnconfigure(g_surface);
                     return g_engine->newUndefined();
                 })
             );
@@ -496,6 +973,10 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
             // context.getCurrentTexture() -> GPUTexture
             g_engine->setProperty(canvasContext, "getCurrentTexture",
                 g_engine->newFunction("getCurrentTexture", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                    if (g_deviceDestroyed || !g_contextConfigured) {
+                        g_engine->throwException("WebGPU canvas context is not configured with a live device");
+                        return g_engine->newUndefined();
+                    }
                     // Get current swapchain texture
                     WGPUTexture texture = getCurrentSwapchainTexture();
                     if (!texture) {
@@ -736,8 +1217,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
 
                         auto canvasContext = g_engine->newObject();
 
-                        // Store reference to our surface
-                        g_engine->setPrivateData(canvasContext, g_surface);
+                        // The shared surface is owned by Context and can retire when the device is destroyed.
 
                         // context.canvas - reference back to canvas element
                         std::string globalName = "__offscreenCanvas_" + std::to_string(canvasId);
@@ -747,6 +1227,10 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                         // context.configure({ device, format, alphaMode })
                         g_engine->setProperty(canvasContext, "configure",
                             g_engine->newFunction("configure", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                                if (g_deviceDestroyed) {
+                                    g_engine->throwException("The single-device Runtime is destroyed; create a new Runtime");
+                                    return g_engine->newUndefined();
+                                }
                                 if (args.empty()) {
                                     g_engine->throwException("configure requires a descriptor");
                                     return g_engine->newUndefined();
@@ -770,6 +1254,10 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                         // context.getCurrentTexture() -> GPUTexture
                         g_engine->setProperty(canvasContext, "getCurrentTexture",
                             g_engine->newFunction("getCurrentTexture", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                                if (g_deviceDestroyed || !g_contextConfigured) {
+                                    g_engine->throwException("WebGPU canvas context is not configured with a live device");
+                                    return g_engine->newUndefined();
+                                }
                                 WGPUTexture texture = getCurrentSwapchainTexture();
                                 if (!texture) {
                                     g_engine->throwException("Failed to get current texture");
@@ -958,14 +1446,17 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
     // ========================================================================
     engine->setProperty(gpuObject, "requestAdapter",
         engine->newFunction("requestAdapter", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
-            // In native runtime, we already have an adapter, so just return a mock adapter object
+            // Expose the adapter selected by the native context.
             auto adapter = g_engine->newObject();
 
             // adapter.requestDevice()
             g_engine->setProperty(adapter, "requestDevice",
                 g_engine->newFunction("requestDevice", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                    // Return a device object wrapping our native device
-                    auto device = g_engine->newObject();
+                    const auto requestError = validateDeviceRequest(args);
+                    if (!requestError.empty()) return rejected(requestError);
+                    if (g_jsDevice.ptr) return resolved(g_jsDevice);
+                    // One native context owns this device; every wrapper observes the same loss/event state.
+                    auto device = g_engine->evalScriptWithResult("new EventTarget()", "<GPUDevice event target>");
                     g_engine->setPrivateData(device, g_device);
 
                     // device.queue
@@ -999,7 +1490,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                             // Submit user command buffers first
                             static int submitCount = 0;
                             submitCount++;
-                            if (!cmdBuffers.empty() && g_queue) {
+                            if (g_queue) {
                                 wgpuQueueSubmit(g_queue, cmdBuffers.size(), cmdBuffers.data());
                                 // Release command buffers after submission (they're consumed by submit)
                                 for (auto cmdBuf : cmdBuffers) {
@@ -1228,17 +1719,8 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                                 if (!g_engine->isUndefined(d)) depthOrArrayLayers = (uint32_t)g_engine->toNumber(d);
                             }
 
-                            // Parse dataLayout {offset?, bytesPerRow, rowsPerImage?}
-                            auto dataLayout = args[2];
-                            auto layoutOffsetVal = g_engine->getProperty(dataLayout, "offset");
-                            uint64_t layoutOffset = g_engine->isUndefined(layoutOffsetVal) ? 0 : (uint64_t)g_engine->toNumber(layoutOffsetVal);
-
-                            uint32_t bytesPerRow = (uint32_t)g_engine->toNumber(g_engine->getProperty(dataLayout, "bytesPerRow"));
-
-                            auto rowsPerImageVal = g_engine->getProperty(dataLayout, "rowsPerImage");
-                            // rowsPerImage must be >= height for 2D textures (wgpu validation requirement)
-                            uint32_t rowsPerImage = g_engine->isUndefined(rowsPerImageVal) ? height : (uint32_t)g_engine->toNumber(rowsPerImageVal);
-                            if (rowsPerImage == 0) rowsPerImage = height;
+                            WGPUTextureDataLayout_Compat layout = {};
+                            if (!copyLayout(args[2], layout)) return g_engine->newUndefined();
 
                             // Create copy structures
                             WGPUImageCopyTexture_Compat destCopy = {};
@@ -1247,15 +1729,10 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                             destCopy.origin = {originX, originY, originZ};
                             destCopy.aspect = WGPUTextureAspect_All;
 
-                            WGPUTextureDataLayout_Compat layout = {};
-                            layout.offset = layoutOffset;
-                            layout.bytesPerRow = bytesPerRow;
-                            layout.rowsPerImage = rowsPerImage;
-
                             WGPUExtent3D copySize = {width, height, depthOrArrayLayers};
 
                             // Write texture
-                            wgpuQueueWriteTexture(g_queue, &destCopy, (uint8_t*)dataPtr + layoutOffset, dataSize - layoutOffset, &layout, &copySize);
+                            wgpuQueueWriteTexture(g_queue, &destCopy, dataPtr, dataSize, &layout, &copySize);
 
                             if (g_verboseLogging) std::cout << "[WebGPU] writeTexture: " << width << "x" << height << " (" << dataSize << " bytes)" << std::endl;
 
@@ -1328,8 +1805,8 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                                             auto ctx2dHandle = it->second->context2d;
                                             auto nativeCtx = static_cast<canvas::Canvas2DContext*>(g_engine->getPrivateData(ctx2dHandle));
                                             if (nativeCtx) {
-                                                imgWidth = it->second->width;
-                                                imgHeight = it->second->height;
+                                                imgWidth = nativeCtx->getWidth();
+                                                imgHeight = nativeCtx->getHeight();
                                                 dataPtr = const_cast<void*>(static_cast<const void*>(nativeCtx->getPixelData()));
                                                 dataSize = nativeCtx->getPixelDataSize();
                                             }
@@ -1352,8 +1829,8 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                                                 if (it != g_offscreenCanvases.end() && it->second->hasContext2d) {
                                                     auto nativeCtx = static_cast<canvas::Canvas2DContext*>(g_engine->getPrivateData(sourceObj));
                                                     if (nativeCtx) {
-                                                        imgWidth = it->second->width;
-                                                        imgHeight = it->second->height;
+                                                        imgWidth = nativeCtx->getWidth();
+                                                        imgHeight = nativeCtx->getHeight();
                                                         dataPtr = const_cast<void*>(static_cast<const void*>(nativeCtx->getPixelData()));
                                                         dataSize = nativeCtx->getPixelDataSize();
                                                     }
@@ -1373,6 +1850,12 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
 
                                 std::cerr << "[WebGPU] copyExternalImageToTexture: unsupported source type, width=" << imgWidth << ", height=" << imgHeight << std::endl;
                                 // Return silently instead of throwing - PixiJS might be able to continue
+                                return g_engine->newUndefined();
+                            }
+
+                            if (imgWidth <= 0 || imgHeight <= 0 ||
+                                static_cast<uint64_t>(imgWidth) * static_cast<uint64_t>(imgHeight) > dataSize / 4) {
+                                g_engine->throwException("External image dimensions exceed the available RGBA pixel data");
                                 return g_engine->newUndefined();
                             }
 
@@ -1402,22 +1885,8 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                                 }
                             }
 
-                            // Optional mipLevel and origin
-                            uint32_t mipLevel = 0;
-                            auto mipLevelVal = g_engine->getProperty(destination, "mipLevel");
-                            if (!g_engine->isUndefined(mipLevelVal)) {
-                                mipLevel = (uint32_t)g_engine->toNumber(mipLevelVal);
-                            }
-
-                            uint32_t originX = 0, originY = 0, originZ = 0;
-                            auto originVal = g_engine->getProperty(destination, "origin");
-                            if (!g_engine->isUndefined(originVal)) {
-                                if (g_engine->isArray(originVal)) {
-                                    originX = (uint32_t)g_engine->toNumber(g_engine->getPropertyIndex(originVal, 0));
-                                    originY = (uint32_t)g_engine->toNumber(g_engine->getPropertyIndex(originVal, 1));
-                                    originZ = (uint32_t)g_engine->toNumber(g_engine->getPropertyIndex(originVal, 2));
-                                }
-                            }
+                            WGPUImageCopyTexture_Compat destCopy = {};
+                            if (!copyTexture(destination, destCopy)) return g_engine->newUndefined();
 
                             // Parse copySize
                             auto sizeVal = args[2];
@@ -1434,6 +1903,11 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                                 auto heightVal = g_engine->getProperty(sizeVal, "height");
                                 if (!g_engine->isUndefined(widthVal)) width = (uint32_t)g_engine->toNumber(widthVal);
                                 if (!g_engine->isUndefined(heightVal)) height = (uint32_t)g_engine->toNumber(heightVal);
+                            }
+
+                            if (width > static_cast<uint32_t>(imgWidth) || height > static_cast<uint32_t>(imgHeight) || depthOrArrayLayers > 1) {
+                                g_engine->throwException("External image copy exceeds the source pixel surface");
+                                return g_engine->newUndefined();
                             }
 
                             // Handle flipY, premultipliedAlpha, and/or BGRA channel swap by writing
@@ -1481,12 +1955,6 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                             }
 
                             // Use writeTexture internally (same effect as copyExternalImageToTexture)
-                            WGPUImageCopyTexture_Compat destCopy = {};
-                            destCopy.texture = texture;
-                            destCopy.mipLevel = mipLevel;
-                            destCopy.origin = {originX, originY, originZ};
-                            destCopy.aspect = WGPUTextureAspect_All;
-
                             WGPUTextureDataLayout_Compat layout = {};
                             layout.offset = 0;
                             layout.bytesPerRow = imgWidth * 4;  // RGBA
@@ -1505,48 +1973,29 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                     // queue.onSubmittedWorkDone() - returns Promise that resolves when GPU work is done
                     g_engine->setProperty(queue, "onSubmittedWorkDone",
                         g_engine->newFunction("onSubmittedWorkDone", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                            // For now, return a Promise that resolves immediately
-                            // Dawn's wgpuQueueOnSubmittedWorkDone is callback-based, which is complex to integrate
-                            // Since we're running single-threaded and submit() is synchronous, work is already done
-                            return g_engine->evalWithResult("Promise.resolve()", "<onSubmittedWorkDone>");
+                            auto deferred = makeDeferred();
+#if defined(MYSTRAL_WEBGPU_DAWN)
+                            WGPUQueueWorkDoneCallbackInfo callback = {};
+                            callback.mode = WGPUCallbackMode_AllowProcessEvents;
+                            callback.callback = onQueueCompleted;
+                            callback.userdata1 = new std::shared_ptr<DeferredResult>(deferred);
+                            wgpuQueueOnSubmittedWorkDone(g_queue, callback);
+#else
+                            settle(deferred, false, nativeError(WGPUErrorType_Internal, "Native queue completion binding is unavailable for this backend"));
+#endif
+                            return deferred->promise;
                         })
                     );
 
                     g_engine->setProperty(device, "queue", queue);
 
                     // device.limits - expose device limits
-                    auto deviceLimits = g_engine->newObject();
-                    g_engine->setProperty(deviceLimits, "maxTextureDimension2D", g_engine->newNumber(8192));
-                    g_engine->setProperty(deviceLimits, "maxColorAttachmentBytesPerSample", g_engine->newNumber(64));
-                    g_engine->setProperty(deviceLimits, "maxBindGroups", g_engine->newNumber(4));
-                    g_engine->setProperty(deviceLimits, "maxBindingsPerBindGroup", g_engine->newNumber(1000));
-                    g_engine->setProperty(deviceLimits, "maxUniformBufferBindingSize", g_engine->newNumber(65536));
-                    g_engine->setProperty(deviceLimits, "maxStorageBufferBindingSize", g_engine->newNumber(134217728));
-                    g_engine->setProperty(deviceLimits, "maxSampledTexturesPerShaderStage", g_engine->newNumber(16));
-                    g_engine->setProperty(deviceLimits, "maxSamplersPerShaderStage", g_engine->newNumber(16));
-                    g_engine->setProperty(deviceLimits, "maxStorageTexturesPerShaderStage", g_engine->newNumber(8));
-                    g_engine->setProperty(deviceLimits, "maxUniformBuffersPerShaderStage", g_engine->newNumber(12));
-                    g_engine->setProperty(deviceLimits, "maxStorageBuffersPerShaderStage", g_engine->newNumber(8));
-                    g_engine->setProperty(deviceLimits, "maxDynamicUniformBuffersPerPipelineLayout", g_engine->newNumber(8));
-                    g_engine->setProperty(deviceLimits, "minUniformBufferOffsetAlignment", g_engine->newNumber(256));
-                    g_engine->setProperty(deviceLimits, "minStorageBufferOffsetAlignment", g_engine->newNumber(256));
+                    auto deviceLimits = nativeLimits(false);
                     g_engine->setProperty(device, "limits", deviceLimits);
 
                     // device.features - Set-like object with enabled features
                     // These should match the features exposed in adapter.features that were requested
-                    auto deviceFeatures = g_engine->newArray(0);
-                    g_engine->setProperty(deviceFeatures, "has",
-                        g_engine->newFunction("has", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                            if (args.empty()) return g_engine->newBoolean(false);
-                            std::string featureName = g_engine->toString(args[0]);
-                            // indirect-first-instance enables non-zero firstInstance in indirect draws
-                            if (featureName == "indirect-first-instance") {
-                                return g_engine->newBoolean(true);
-                            }
-                            // timestamp-query is NOT supported yet - bindings not implemented
-                            return g_engine->newBoolean(false);
-                        })
-                    );
+                    auto deviceFeatures = nativeFeatures(false);
                     g_engine->setProperty(device, "features", deviceFeatures);
 
                     // device.createBuffer(descriptor)
@@ -1598,14 +2047,14 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                                     auto it = g_bufferRegistry.find(bufferId);
                                     if (it == g_bufferRegistry.end()) {
                                         std::cerr << "[WebGPU] mapAsync: Buffer " << bufferId << " not found" << std::endl;
-                                        return g_engine->evalWithResult("Promise.reject(new Error('Buffer not found'))", "mapAsync-error");
+                                        return g_engine->evalScriptWithResult("Promise.reject(new Error('Buffer not found'))", "mapAsync-error");
                                     }
 
                                     auto& bufferInfo = it->second;
 
                                     // Already mapped (mappedAtCreation)?
                                     if (bufferInfo.isMapped) {
-                                        return g_engine->evalWithResult("Promise.resolve()", "mapAsync-already-mapped");
+                                        return g_engine->evalScriptWithResult("Promise.resolve()", "mapAsync-already-mapped");
                                     }
 
                                     // Get mode (default to READ)
@@ -1645,9 +2094,9 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
 
 #if WGPU_BUFFER_MAP_USES_CALLBACK_INFO
                                     // Dawn uses CallbackInfo struct with 4-param callback
-                                    // Use AllowSpontaneous mode so callback can be invoked at any time
+                                    // The mapping loop drives ProcessEvents on the JS thread that owns this state.
                                     WGPUBufferMapCallbackInfo mapCallbackInfo = {};
-                                    mapCallbackInfo.mode = WGPUCallbackMode_AllowSpontaneous;
+                                    mapCallbackInfo.mode = WGPUCallbackMode_AllowProcessEvents;
                                     mapCallbackInfo.callback = onBufferMapped;
                                     mapCallbackInfo.userdata1 = &g_bufferMapData;
                                     mapCallbackInfo.userdata2 = nullptr;
@@ -1682,14 +2131,14 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                                     if (g_bufferMapData.status == WGPUBufferMapAsyncStatus_Success_Compat) {
                                         bufferInfo.isMapped = true;
                                         bufferInfo.mapMode = mode;  // Store whether mapped for read or write
-                                        return g_engine->evalWithResult("Promise.resolve()", "mapAsync-success");
+                                        return g_engine->evalScriptWithResult("Promise.resolve()", "mapAsync-success");
                                     } else {
                                         std::cerr << "[WebGPU] mapAsync: Failed with status " << g_bufferMapData.status;
                                         if (!g_bufferMapData.errorMessage.empty()) {
                                             std::cerr << " - " << g_bufferMapData.errorMessage;
                                         }
                                         std::cerr << std::endl;
-                                        return g_engine->evalWithResult("Promise.reject(new Error('Buffer map failed'))", "mapAsync-failed");
+                                        return g_engine->evalScriptWithResult("Promise.reject(new Error('Buffer map failed'))", "mapAsync-failed");
                                     }
                                 })
                             );
@@ -1801,6 +2250,20 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
 
                             auto jsShader = g_engine->newObject();
                             g_engine->setPrivateData(jsShader, shaderModule);
+                            g_engine->setProperty(jsShader, "getCompilationInfo",
+                                g_engine->newFunction("getCompilationInfo", [shaderModule](void*, const std::vector<js::JSValueHandle>&) {
+                                    auto deferred = makeDeferred();
+#if defined(MYSTRAL_WEBGPU_DAWN)
+                                    WGPUCompilationInfoCallbackInfo callback = {};
+                                    callback.mode = WGPUCallbackMode_AllowProcessEvents;
+                                    callback.callback = onCompilationCompleted;
+                                    callback.userdata1 = new std::shared_ptr<DeferredResult>(deferred);
+                                    wgpuShaderModuleGetCompilationInfo(shaderModule, callback);
+#else
+                                    settle(deferred, false, nativeError(WGPUErrorType_Internal, "Native compilation information binding is unavailable for this backend"));
+#endif
+                                    return deferred->promise;
+                                }));
 
                             return jsShader;
                         })
@@ -1867,6 +2330,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
 
                             auto buffersArray = g_engine->getProperty(vertex, "buffers");
                             if (!g_engine->isUndefined(buffersArray)) {
+                                if (!sequenceArray(buffersArray, buffersArray)) return g_engine->newUndefined();
                                 auto buffersLen = g_engine->getProperty(buffersArray, "length");
                                 int bufferCount = (int)g_engine->toNumber(buffersLen);
 
@@ -1889,6 +2353,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                                     // Parse attributes
                                     auto attrsArray = g_engine->getProperty(buffer, "attributes");
                                     if (!g_engine->isUndefined(attrsArray)) {
+                                        if (!sequenceArray(attrsArray, attrsArray)) return g_engine->newUndefined();
                                         auto attrsLen = g_engine->getProperty(attrsArray, "length");
                                         int attrCount = (int)g_engine->toNumber(attrsLen);
 
@@ -1958,6 +2423,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                                 // Parse targets from fragment descriptor
                                 auto targetsProp = g_engine->getProperty(fragment, "targets");
                                 if (!g_engine->isUndefined(targetsProp)) {
+                                    if (!sequenceArray(targetsProp, targetsProp)) return g_engine->newUndefined();
                                     targetsExplicitlySpecified = true;  // Even if empty array
                                     auto targetsLen = g_engine->getProperty(targetsProp, "length");
                                     int targetCount = (int)g_engine->toNumber(targetsLen);
@@ -1976,6 +2442,15 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                                             targetState.format = g_surfaceFormat;
                                         }
                                         targetState.writeMask = WGPUColorWriteMask_All;
+                                        auto writeMask = g_engine->getProperty(target, "writeMask");
+                                        if (!g_engine->isUndefined(writeMask)) {
+                                            const double mask = std::trunc(g_engine->toNumber(writeMask));
+                                            if (!std::isfinite(mask) || mask < 0 || mask >= 4294967296.0) {
+                                                g_engine->throwException("Color write mask is outside its unsigned integer range");
+                                                return g_engine->newUndefined();
+                                            }
+                                            targetState.writeMask = static_cast<WGPUColorWriteMask>(mask);
+                                        }
 
                                         // Parse blend state if provided
                                         auto blendProp = g_engine->getProperty(target, "blend");
@@ -2370,6 +2845,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
 
                                     auto descriptor = args[0];
                                     auto colorAttachments = g_engine->getProperty(descriptor, "colorAttachments");
+                                    if (!sequenceArray(colorAttachments, colorAttachments)) return g_engine->newUndefined();
 
                                     // Parse all color attachments (deferred renderer uses multiple)
                                     auto attachmentsLengthProp = g_engine->getProperty(colorAttachments, "length");
@@ -2473,34 +2949,23 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                                         WGPUTextureView depthView = (WGPUTextureView)g_engine->getPrivateData(depthViewHandle);
                                         depthStencilAttachment.view = depthView;
 
-                                        // Depth clear value (default 1.0)
+                                        // Preserve optional operations for native attachment/format validation.
                                         auto depthClearValueProp = g_engine->getProperty(depthStencilProp, "depthClearValue");
                                         depthStencilAttachment.depthClearValue = g_engine->isUndefined(depthClearValueProp)
-                                            ? 1.0f : (float)g_engine->toNumber(depthClearValueProp);
-
-                                        // Depth load/store ops (default clear/store)
-                                        auto depthLoadOpProp = g_engine->getProperty(depthStencilProp, "depthLoadOp");
-                                        if (!g_engine->isUndefined(depthLoadOpProp)) {
-                                            std::string loadOpStr = g_engine->toString(depthLoadOpProp);
-                                            if (loadOpStr == "load") depthStencilAttachment.depthLoadOp = WGPULoadOp_Load;
-                                            else depthStencilAttachment.depthLoadOp = WGPULoadOp_Clear;
-                                        } else {
-                                            depthStencilAttachment.depthLoadOp = WGPULoadOp_Clear;
-                                        }
-
-                                        auto depthStoreOpProp = g_engine->getProperty(depthStencilProp, "depthStoreOp");
-                                        if (!g_engine->isUndefined(depthStoreOpProp)) {
-                                            std::string storeOpStr = g_engine->toString(depthStoreOpProp);
-                                            if (storeOpStr == "discard") depthStencilAttachment.depthStoreOp = WGPUStoreOp_Discard;
-                                            else depthStencilAttachment.depthStoreOp = WGPUStoreOp_Store;
-                                        } else {
-                                            depthStencilAttachment.depthStoreOp = WGPUStoreOp_Store;
-                                        }
-
-                                        // Stencil ops (default undefined/disabled)
-                                        depthStencilAttachment.stencilClearValue = 0;
-                                        depthStencilAttachment.stencilLoadOp = WGPULoadOp_Undefined;
-                                        depthStencilAttachment.stencilStoreOp = WGPUStoreOp_Undefined;
+                                            ? WGPU_DEPTH_CLEAR_VALUE_UNDEFINED : (float)g_engine->toNumber(depthClearValueProp);
+                                        if (!renderPassLoadOp(g_engine->getProperty(depthStencilProp, "depthLoadOp"), depthStencilAttachment.depthLoadOp) ||
+                                            !renderPassStoreOp(g_engine->getProperty(depthStencilProp, "depthStoreOp"), depthStencilAttachment.depthStoreOp) ||
+                                            !renderPassLoadOp(g_engine->getProperty(depthStencilProp, "stencilLoadOp"), depthStencilAttachment.stencilLoadOp) ||
+                                            !renderPassStoreOp(g_engine->getProperty(depthStencilProp, "stencilStoreOp"), depthStencilAttachment.stencilStoreOp))
+                                            return g_engine->newUndefined();
+                                        auto depthReadOnly = g_engine->getProperty(depthStencilProp, "depthReadOnly");
+                                        auto stencilReadOnly = g_engine->getProperty(depthStencilProp, "stencilReadOnly");
+                                        depthStencilAttachment.depthReadOnly = !g_engine->isUndefined(depthReadOnly) && g_engine->toBoolean(depthReadOnly);
+                                        depthStencilAttachment.stencilReadOnly = !g_engine->isUndefined(stencilReadOnly) && g_engine->toBoolean(stencilReadOnly);
+                                        auto stencilClear = g_engine->getProperty(depthStencilProp, "stencilClearValue");
+                                        uint64_t stencilClearValue;
+                                        if (!copyUnsigned(stencilClear, 0, false, stencilClearValue)) return g_engine->newUndefined();
+                                        depthStencilAttachment.stencilClearValue = static_cast<uint32_t>(stencilClearValue);
 
                                         renderPassDesc.depthStencilAttachment = &depthStencilAttachment;
                                         if (g_verboseLogging) std::cout << "[WebGPU] Render pass with depth attachment, clear=" << depthStencilAttachment.depthClearValue << std::endl;
@@ -2547,11 +3012,12 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                                             }
 
                                             uint32_t groupIndex = (uint32_t)g_engine->toNumber(args[0]);
-                                            WGPUBindGroup bindGroup = (WGPUBindGroup)g_engine->getPrivateData(args[1]);
-
-                                            if (g_jsRenderPass && bindGroup) {
-                                                // TODO: Support dynamic offsets
-                                                wgpuRenderPassEncoderSetBindGroup(g_jsRenderPass, groupIndex, bindGroup, 0, nullptr);
+                                            WGPUBindGroup bindGroup = g_engine->isNull(args[1]) || g_engine->isUndefined(args[1]) ?
+                                                nullptr : static_cast<WGPUBindGroup>(g_engine->getPrivateData(args[1]));
+                                            std::vector<uint32_t> offsets;
+                                            if (!dynamicOffsets(args, offsets)) return g_engine->newUndefined();
+                                            if (g_jsRenderPass) {
+                                                wgpuRenderPassEncoderSetBindGroup(g_jsRenderPass, groupIndex, bindGroup, offsets.size(), offsets.data());
                                                 if (g_verboseLogging) std::cout << "[WebGPU] Set bind group at index " << groupIndex << std::endl;
                                             }
 
@@ -2845,11 +3311,19 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                                     // computePass.setBindGroup(index, bindGroup, dynamicOffsets?)
                                     g_engine->setProperty(jsComputePass, "setBindGroup",
                                         g_engine->newFunction("setBindGroup", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                                            if (args.size() < 2) return g_engine->newUndefined();
-                                            uint32_t index = (uint32_t)g_engine->toNumber(args[0]);
-                                            WGPUBindGroup bindGroup = (WGPUBindGroup)g_engine->getPrivateData(args[1]);
-                                            if (g_jsComputePass && bindGroup) {
-                                                wgpuComputePassEncoderSetBindGroup(g_jsComputePass, index, bindGroup, 0, nullptr);
+                                            if (args.size() < 2) {
+                                                g_engine->throwException("setBindGroup requires an index and nullable bind group");
+                                                return g_engine->newUndefined();
+                                            }
+                                            uint64_t index;
+                                            if (!copyUnsigned(args[0], 0, false, index)) return g_engine->newUndefined();
+                                            WGPUBindGroup bindGroup = g_engine->isNull(args[1]) || g_engine->isUndefined(args[1]) ?
+                                                nullptr : static_cast<WGPUBindGroup>(g_engine->getPrivateData(args[1]));
+                                            std::vector<uint32_t> offsets;
+                                            if (!dynamicOffsets(args, offsets)) return g_engine->newUndefined();
+                                            if (g_jsComputePass) {
+                                                wgpuComputePassEncoderSetBindGroup(g_jsComputePass, static_cast<uint32_t>(index),
+                                                    bindGroup, offsets.size(), offsets.data());
                                             }
                                             return g_engine->newUndefined();
                                         })
@@ -2868,6 +3342,27 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                                             return g_engine->newUndefined();
                                         })
                                     );
+
+                                    g_engine->setProperty(jsComputePass, "dispatchWorkgroupsIndirect",
+                                        g_engine->newFunction("dispatchWorkgroupsIndirect", [](void*, const std::vector<js::JSValueHandle>& args) {
+                                            if (args.size() < 2 || g_engine->isUndefined(args[1]) || !g_jsComputePass) {
+                                                g_engine->throwException("dispatchWorkgroupsIndirect requires an active pass, buffer, and byte offset");
+                                                return g_engine->newUndefined();
+                                            }
+                                            if (!g_engine->isObject(args[0])) {
+                                                g_engine->throwException("dispatchWorkgroupsIndirect requires a GPUBuffer");
+                                                return g_engine->newUndefined();
+                                            }
+                                            auto buffer = static_cast<WGPUBuffer>(g_engine->getPrivateData(args[0]));
+                                            uint64_t offset;
+                                            if (!copyUnsigned(args[1], 0, true, offset)) return g_engine->newUndefined();
+                                            if (!buffer) {
+                                                g_engine->throwException("dispatchWorkgroupsIndirect requires a GPUBuffer");
+                                                return g_engine->newUndefined();
+                                            }
+                                            wgpuComputePassEncoderDispatchWorkgroupsIndirect(g_jsComputePass, buffer, offset);
+                                            return g_engine->newUndefined();
+                                        }));
 
                                     // computePass.end()
                                     g_engine->setProperty(jsComputePass, "end",
@@ -2904,193 +3399,44 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                                 })
                             );
 
-                            // encoder.copyBufferToTexture(source, destination, copySize)
+                            // Texture copies share WebIDL defaults and preserve unspecified native strides.
                             g_engine->setProperty(jsEncoder, "copyBufferToTexture",
-                                g_engine->newFunction("copyBufferToTexture", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                                g_engine->newFunction("copyBufferToTexture", [](void*, const std::vector<js::JSValueHandle>& args) {
                                     if (args.size() < 3 || !g_jsCommandEncoder) return g_engine->newUndefined();
-
-                                    auto sourceProp = args[0];
-                                    auto destProp = args[1];
-                                    auto sizeProp = args[2];
-
-                                    // Source (buffer info)
-                                    WGPUBuffer buffer = (WGPUBuffer)g_engine->getPrivateData(g_engine->getProperty(sourceProp, "buffer"));
-                                    uint64_t offset = (uint64_t)g_engine->toNumber(g_engine->getProperty(sourceProp, "offset"));
-                                    uint32_t bytesPerRow = (uint32_t)g_engine->toNumber(g_engine->getProperty(sourceProp, "bytesPerRow"));
-                                    uint32_t rowsPerImage = (uint32_t)g_engine->toNumber(g_engine->getProperty(sourceProp, "rowsPerImage"));
-
-                                    // Destination (texture info)
-                                    WGPUTexture texture = (WGPUTexture)g_engine->getPrivateData(g_engine->getProperty(destProp, "texture"));
-                                    uint32_t mipLevel = (uint32_t)g_engine->toNumber(g_engine->getProperty(destProp, "mipLevel"));
-                                    auto originProp = g_engine->getProperty(destProp, "origin");
-                                    uint32_t originX = 0, originY = 0, originZ = 0;
-                                    if (!g_engine->isUndefined(originProp)) {
-                                        originX = (uint32_t)g_engine->toNumber(g_engine->getPropertyIndex(originProp, 0));
-                                        originY = (uint32_t)g_engine->toNumber(g_engine->getPropertyIndex(originProp, 1));
-                                        originZ = (uint32_t)g_engine->toNumber(g_engine->getPropertyIndex(originProp, 2));
-                                    }
-
-                                    // Copy size
-                                    uint32_t width = (uint32_t)g_engine->toNumber(g_engine->getPropertyIndex(sizeProp, 0));
-                                    uint32_t height = (uint32_t)g_engine->toNumber(g_engine->getPropertyIndex(sizeProp, 1));
-                                    uint32_t depthOrLayers = (uint32_t)g_engine->toNumber(g_engine->getPropertyIndex(sizeProp, 2));
-                                    if (depthOrLayers == 0) depthOrLayers = 1;
-
-                                    if (buffer && texture) {
-                                        WGPUImageCopyBuffer_Compat srcCopy = {};
-                                        srcCopy.buffer = buffer;
-                                        srcCopy.layout.offset = offset;
-                                        srcCopy.layout.bytesPerRow = bytesPerRow;
-                                        srcCopy.layout.rowsPerImage = rowsPerImage > 0 ? rowsPerImage : height;
-
-                                        WGPUImageCopyTexture_Compat dstCopy = {};
-                                        dstCopy.texture = texture;
-                                        dstCopy.mipLevel = mipLevel;
-                                        dstCopy.origin = {originX, originY, originZ};
-
-                                        WGPUExtent3D copySize = {width, height, depthOrLayers};
-                                        wgpuCommandEncoderCopyBufferToTexture(g_jsCommandEncoder, &srcCopy, &dstCopy, &copySize);
-                                    }
+                                    WGPUImageCopyBuffer_Compat source = {};
+                                    source.buffer = static_cast<WGPUBuffer>(g_engine->getPrivateData(g_engine->getProperty(args[0], "buffer")));
+                                    WGPUImageCopyTexture_Compat destination = {};
+                                    WGPUExtent3D extent = {};
+                                    if (!copyLayout(args[0], source.layout) || !copyTexture(args[1], destination) ||
+                                        !copyExtent(args[2], extent)) return g_engine->newUndefined();
+                                    if (source.buffer && destination.texture)
+                                        wgpuCommandEncoderCopyBufferToTexture(g_jsCommandEncoder, &source, &destination, &extent);
                                     return g_engine->newUndefined();
-                                })
-                            );
-
-                            // encoder.copyTextureToBuffer(source, destination, copySize)
+                                }));
                             g_engine->setProperty(jsEncoder, "copyTextureToBuffer",
-                                g_engine->newFunction("copyTextureToBuffer", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                                g_engine->newFunction("copyTextureToBuffer", [](void*, const std::vector<js::JSValueHandle>& args) {
                                     if (args.size() < 3 || !g_jsCommandEncoder) return g_engine->newUndefined();
-
-                                    auto sourceProp = args[0];
-                                    auto destProp = args[1];
-                                    auto sizeProp = args[2];
-
-                                    // Source (texture info)
-                                    WGPUTexture texture = (WGPUTexture)g_engine->getPrivateData(g_engine->getProperty(sourceProp, "texture"));
-                                    uint32_t mipLevel = (uint32_t)g_engine->toNumber(g_engine->getProperty(sourceProp, "mipLevel"));
-                                    auto originProp = g_engine->getProperty(sourceProp, "origin");
-                                    uint32_t originX = 0, originY = 0, originZ = 0;
-                                    if (!g_engine->isUndefined(originProp)) {
-                                        originX = (uint32_t)g_engine->toNumber(g_engine->getPropertyIndex(originProp, 0));
-                                        originY = (uint32_t)g_engine->toNumber(g_engine->getPropertyIndex(originProp, 1));
-                                        originZ = (uint32_t)g_engine->toNumber(g_engine->getPropertyIndex(originProp, 2));
-                                    }
-
-                                    // Destination (buffer info)
-                                    WGPUBuffer buffer = (WGPUBuffer)g_engine->getPrivateData(g_engine->getProperty(destProp, "buffer"));
-                                    uint64_t offset = (uint64_t)g_engine->toNumber(g_engine->getProperty(destProp, "offset"));
-                                    uint32_t bytesPerRow = (uint32_t)g_engine->toNumber(g_engine->getProperty(destProp, "bytesPerRow"));
-                                    uint32_t rowsPerImage = (uint32_t)g_engine->toNumber(g_engine->getProperty(destProp, "rowsPerImage"));
-
-                                    // Copy size - can be array [w,h,d] or object {width, height, depthOrArrayLayers}
-                                    uint32_t width = 0, height = 0, depthOrLayers = 1;
-                                    auto widthProp = g_engine->getProperty(sizeProp, "width");
-                                    if (!g_engine->isUndefined(widthProp)) {
-                                        // Object format: { width, height, depthOrArrayLayers }
-                                        width = (uint32_t)g_engine->toNumber(widthProp);
-                                        height = (uint32_t)g_engine->toNumber(g_engine->getProperty(sizeProp, "height"));
-                                        auto depthProp = g_engine->getProperty(sizeProp, "depthOrArrayLayers");
-                                        depthOrLayers = g_engine->isUndefined(depthProp) ? 1 : (uint32_t)g_engine->toNumber(depthProp);
-                                    } else {
-                                        // Array format: [width, height, depth]
-                                        width = (uint32_t)g_engine->toNumber(g_engine->getPropertyIndex(sizeProp, 0));
-                                        height = (uint32_t)g_engine->toNumber(g_engine->getPropertyIndex(sizeProp, 1));
-                                        depthOrLayers = (uint32_t)g_engine->toNumber(g_engine->getPropertyIndex(sizeProp, 2));
-                                    }
-                                    if (depthOrLayers == 0) depthOrLayers = 1;
-
-                                    if (g_verboseLogging) {
-                                        std::cout << "[WebGPU] copyTextureToBuffer: texture=" << texture
-                                                  << ", buffer=" << buffer
-                                                  << ", size=" << width << "x" << height << "x" << depthOrLayers
-                                                  << ", bytesPerRow=" << bytesPerRow << std::endl;
-                                    }
-
-                                    if (buffer && texture) {
-                                        WGPUImageCopyTexture_Compat srcCopy = {};
-                                        srcCopy.texture = texture;
-                                        srcCopy.mipLevel = mipLevel;
-                                        srcCopy.origin = {originX, originY, originZ};
-
-                                        WGPUImageCopyBuffer_Compat dstCopy = {};
-                                        dstCopy.buffer = buffer;
-                                        dstCopy.layout.offset = offset;
-                                        dstCopy.layout.bytesPerRow = bytesPerRow;
-                                        dstCopy.layout.rowsPerImage = rowsPerImage > 0 ? rowsPerImage : height;
-
-                                        WGPUExtent3D copySize = {width, height, depthOrLayers};
-                                        wgpuCommandEncoderCopyTextureToBuffer(g_jsCommandEncoder, &srcCopy, &dstCopy, &copySize);
-                                    }
+                                    WGPUImageCopyTexture_Compat source = {};
+                                    WGPUImageCopyBuffer_Compat destination = {};
+                                    destination.buffer = static_cast<WGPUBuffer>(g_engine->getPrivateData(g_engine->getProperty(args[1], "buffer")));
+                                    WGPUExtent3D extent = {};
+                                    if (!copyTexture(args[0], source) || !copyLayout(args[1], destination.layout) ||
+                                        !copyExtent(args[2], extent)) return g_engine->newUndefined();
+                                    if (source.texture && destination.buffer)
+                                        wgpuCommandEncoderCopyTextureToBuffer(g_jsCommandEncoder, &source, &destination, &extent);
                                     return g_engine->newUndefined();
-                                })
-                            );
-
-                            // encoder.copyTextureToTexture(source, destination, copySize)
+                                }));
                             g_engine->setProperty(jsEncoder, "copyTextureToTexture",
-                                g_engine->newFunction("copyTextureToTexture", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                                g_engine->newFunction("copyTextureToTexture", [](void*, const std::vector<js::JSValueHandle>& args) {
                                     if (args.size() < 3 || !g_jsCommandEncoder) return g_engine->newUndefined();
-
-                                    auto sourceProp = args[0];
-                                    auto destProp = args[1];
-                                    auto sizeProp = args[2];
-
-                                    // Source texture
-                                    WGPUTexture srcTexture = (WGPUTexture)g_engine->getPrivateData(g_engine->getProperty(sourceProp, "texture"));
-                                    uint32_t srcMipLevel = (uint32_t)g_engine->toNumber(g_engine->getProperty(sourceProp, "mipLevel"));
-                                    auto srcOriginProp = g_engine->getProperty(sourceProp, "origin");
-                                    uint32_t srcOriginX = 0, srcOriginY = 0, srcOriginZ = 0;
-                                    if (!g_engine->isUndefined(srcOriginProp)) {
-                                        srcOriginX = (uint32_t)g_engine->toNumber(g_engine->getPropertyIndex(srcOriginProp, 0));
-                                        srcOriginY = (uint32_t)g_engine->toNumber(g_engine->getPropertyIndex(srcOriginProp, 1));
-                                        srcOriginZ = (uint32_t)g_engine->toNumber(g_engine->getPropertyIndex(srcOriginProp, 2));
-                                    }
-
-                                    // Destination texture
-                                    WGPUTexture dstTexture = (WGPUTexture)g_engine->getPrivateData(g_engine->getProperty(destProp, "texture"));
-                                    uint32_t dstMipLevel = (uint32_t)g_engine->toNumber(g_engine->getProperty(destProp, "mipLevel"));
-                                    auto dstOriginProp = g_engine->getProperty(destProp, "origin");
-                                    uint32_t dstOriginX = 0, dstOriginY = 0, dstOriginZ = 0;
-                                    if (!g_engine->isUndefined(dstOriginProp)) {
-                                        dstOriginX = (uint32_t)g_engine->toNumber(g_engine->getPropertyIndex(dstOriginProp, 0));
-                                        dstOriginY = (uint32_t)g_engine->toNumber(g_engine->getPropertyIndex(dstOriginProp, 1));
-                                        dstOriginZ = (uint32_t)g_engine->toNumber(g_engine->getPropertyIndex(dstOriginProp, 2));
-                                    }
-
-                                    // Copy size - handle both array and object forms
-                                    uint32_t width = 1, height = 1, depthOrLayers = 1;
-                                    if (g_engine->isArray(sizeProp)) {
-                                        width = (uint32_t)g_engine->toNumber(g_engine->getPropertyIndex(sizeProp, 0));
-                                        height = (uint32_t)g_engine->toNumber(g_engine->getPropertyIndex(sizeProp, 1));
-                                        auto depthVal = g_engine->getPropertyIndex(sizeProp, 2);
-                                        if (!g_engine->isUndefined(depthVal)) {
-                                            depthOrLayers = (uint32_t)g_engine->toNumber(depthVal);
-                                        }
-                                    } else {
-                                        width = (uint32_t)g_engine->toNumber(g_engine->getProperty(sizeProp, "width"));
-                                        height = (uint32_t)g_engine->toNumber(g_engine->getProperty(sizeProp, "height"));
-                                        auto depthVal = g_engine->getProperty(sizeProp, "depthOrArrayLayers");
-                                        if (!g_engine->isUndefined(depthVal)) {
-                                            depthOrLayers = (uint32_t)g_engine->toNumber(depthVal);
-                                        }
-                                    }
-                                    if (depthOrLayers == 0) depthOrLayers = 1;
-
-                                    if (srcTexture && dstTexture) {
-                                        WGPUImageCopyTexture_Compat srcCopy = {};
-                                        srcCopy.texture = srcTexture;
-                                        srcCopy.mipLevel = srcMipLevel;
-                                        srcCopy.origin = {srcOriginX, srcOriginY, srcOriginZ};
-
-                                        WGPUImageCopyTexture_Compat dstCopy = {};
-                                        dstCopy.texture = dstTexture;
-                                        dstCopy.mipLevel = dstMipLevel;
-                                        dstCopy.origin = {dstOriginX, dstOriginY, dstOriginZ};
-
-                                        WGPUExtent3D copySize = {width, height, depthOrLayers};
-                                        wgpuCommandEncoderCopyTextureToTexture(g_jsCommandEncoder, &srcCopy, &dstCopy, &copySize);
-                                    }
+                                    WGPUImageCopyTexture_Compat source = {}, destination = {};
+                                    WGPUExtent3D extent = {};
+                                    if (!copyTexture(args[0], source) || !copyTexture(args[1], destination) ||
+                                        !copyExtent(args[2], extent)) return g_engine->newUndefined();
+                                    if (source.texture && destination.texture)
+                                        wgpuCommandEncoderCopyTextureToTexture(g_jsCommandEncoder, &source, &destination, &extent);
                                     return g_engine->newUndefined();
-                                })
-                            );
+                                }));
 
                             // encoder.clearBuffer(buffer, offset?, size?)
                             g_engine->setProperty(jsEncoder, "clearBuffer",
@@ -3524,6 +3870,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
 
                             auto descriptor = args[0];
                             auto entries = g_engine->getProperty(descriptor, "entries");
+                            if (!sequenceArray(entries, entries)) return g_engine->newUndefined();
                             auto lengthProp = g_engine->getProperty(entries, "length");
                             int entryCount = g_engine->isUndefined(lengthProp) ? 0 : (int)g_engine->toNumber(lengthProp);
 
@@ -3555,6 +3902,12 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                                         // Default to uniform for unknown types
                                         layoutEntry.buffer.type = WGPUBufferBindingType_Uniform;
                                     }
+                                    auto dynamic = g_engine->getProperty(buffer, "hasDynamicOffset");
+                                    layoutEntry.buffer.hasDynamicOffset = !g_engine->isUndefined(dynamic) && g_engine->toBoolean(dynamic);
+                                    uint64_t minimumSize;
+                                    if (!copyUnsigned(g_engine->getProperty(buffer, "minBindingSize"), 0, true, minimumSize))
+                                        return g_engine->newUndefined();
+                                    layoutEntry.buffer.minBindingSize = minimumSize;
                                     std::cout << "[WebGPU] BindGroupLayout buffer binding "
                                               << layoutEntry.binding << ": type='" << typeStr
                                               << "', enum=" << static_cast<int>(layoutEntry.buffer.type)
@@ -3674,6 +4027,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                             WGPUBindGroupLayout layout = (WGPUBindGroupLayout)g_engine->getPrivateData(layoutHandle);
 
                             auto entries = g_engine->getProperty(descriptor, "entries");
+                            if (!sequenceArray(entries, entries)) return g_engine->newUndefined();
                             auto lengthProp = g_engine->getProperty(entries, "length");
                             int entryCount = g_engine->isUndefined(lengthProp) ? 0 : (int)g_engine->toNumber(lengthProp);
 
@@ -3784,6 +4138,7 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
 
                             auto descriptor = args[0];
                             auto bindGroupLayouts = g_engine->getProperty(descriptor, "bindGroupLayouts");
+                            if (!sequenceArray(bindGroupLayouts, bindGroupLayouts)) return g_engine->newUndefined();
                             auto lengthProp = g_engine->getProperty(bindGroupLayouts, "length");
                             int layoutCount = g_engine->isUndefined(lengthProp) ? 0 : (int)g_engine->toNumber(lengthProp);
 
@@ -4027,20 +4382,11 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                                 g_engine->newFunction("setBindGroup", [capturedEncoder](void* ctx, const std::vector<js::JSValueHandle>& args) {
                                     if (args.size() < 2) return g_engine->newUndefined();
                                     uint32_t index = (uint32_t)g_engine->toNumber(args[0]);
-                                    WGPUBindGroup bindGroup = (WGPUBindGroup)g_engine->getPrivateData(args[1]);
-
-                                    // Parse dynamic offsets if provided
-                                    std::vector<uint32_t> dynamicOffsets;
-                                    if (args.size() > 2 && !g_engine->isUndefined(args[2])) {
-                                        auto offsetsArray = args[2];
-                                        auto lengthProp = g_engine->getProperty(offsetsArray, "length");
-                                        int offsetCount = g_engine->isUndefined(lengthProp) ? 0 : (int)g_engine->toNumber(lengthProp);
-                                        for (int i = 0; i < offsetCount; i++) {
-                                            dynamicOffsets.push_back((uint32_t)g_engine->toNumber(g_engine->getPropertyIndex(offsetsArray, i)));
-                                        }
-                                    }
-
-                                    wgpuRenderBundleEncoderSetBindGroup(capturedEncoder, index, bindGroup, dynamicOffsets.size(), dynamicOffsets.data());
+                                    WGPUBindGroup bindGroup = g_engine->isNull(args[1]) || g_engine->isUndefined(args[1]) ?
+                                        nullptr : static_cast<WGPUBindGroup>(g_engine->getPrivateData(args[1]));
+                                    std::vector<uint32_t> offsets;
+                                    if (!dynamicOffsets(args, offsets)) return g_engine->newUndefined();
+                                    wgpuRenderBundleEncoderSetBindGroup(capturedEncoder, index, bindGroup, offsets.size(), offsets.data());
                                     return g_engine->newUndefined();
                                 })
                             );
@@ -4096,12 +4442,16 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                     // Used by Three.js for error handling during pipeline creation
                     g_engine->setProperty(device, "pushErrorScope",
                         g_engine->newFunction("pushErrorScope", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                            // In native runtime, we can use Dawn's error scope API
-                            // For now, just no-op since Dawn reports errors to the error callback
-                            if (g_verboseLogging) {
-                                std::string filter = args.empty() ? "validation" : g_engine->toString(args[0]);
-                                std::cout << "[WebGPU] pushErrorScope: " << filter << std::endl;
+                            const std::string filter = args.empty() ? "" : g_engine->toString(args[0]);
+                            WGPUErrorFilter native;
+                            if (filter == "validation") native = WGPUErrorFilter_Validation;
+                            else if (filter == "out-of-memory") native = WGPUErrorFilter_OutOfMemory;
+                            else if (filter == "internal") native = WGPUErrorFilter_Internal;
+                            else {
+                                g_engine->throwException("Invalid WebGPU error scope filter");
+                                return g_engine->newUndefined();
                             }
+                            wgpuDevicePushErrorScope(g_device, native);
                             return g_engine->newUndefined();
                         })
                     );
@@ -4110,29 +4460,38 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                     // Returns Promise<GPUError | null>
                     g_engine->setProperty(device, "popErrorScope",
                         g_engine->newFunction("popErrorScope", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                            // Return a Promise that resolves to null (no error)
-                            // In a full implementation, this would check for actual errors
-                            if (g_verboseLogging) {
-                                std::cout << "[WebGPU] popErrorScope" << std::endl;
-                            }
-                            // Use evalScriptWithResult (not evalWithResult) to get the actual Promise value
-                            // evalWithResult uses module mode which returns module evaluation result, not expression value
-                            return g_engine->evalScriptWithResult("Promise.resolve(null)", "popErrorScope");
+                            auto deferred = makeDeferred();
+#if defined(MYSTRAL_WEBGPU_DAWN)
+                            WGPUPopErrorScopeCallbackInfo callback = {};
+                            callback.mode = WGPUCallbackMode_AllowProcessEvents;
+                            callback.callback = onScopeCompleted;
+                            callback.userdata1 = new std::shared_ptr<DeferredResult>(deferred);
+                            wgpuDevicePopErrorScope(g_device, callback);
+#else
+                            settle(deferred, false, nativeError(WGPUErrorType_Internal, "Native error scope binding is unavailable for this backend"));
+#endif
+                            return deferred->promise;
                         })
                     );
 
-                    // device.lost - Promise that resolves when the device is lost
-                    // Required by Three.js WebGPU renderer during init
-                    // We create a Promise that never resolves (device never lost in normal operation)
-                    auto deviceLostPromise = g_engine->evalWithResult(
-                        "new Promise(function(resolve) { globalThis.__mystral_device_lost_resolve = resolve; })",
-                        "device.lost"
-                    );
-                    g_engine->setProperty(device, "lost", deviceLostPromise);
+                    g_lostResult = makeDeferred();
+                    g_engine->setProperty(device, "lost", g_lostResult->promise);
+                    g_engine->setProperty(device, "destroy",
+                        g_engine->newFunction("destroy", [](void*, const std::vector<js::JSValueHandle>&) {
+                            if (!g_deviceDestroyed) {
+                                if (g_surface && !releaseContextSurfaceBeforeDeviceDestroy(g_device)) {
+                                    g_engine->throwException("Cannot retire the device's Context-owned surface");
+                                    return g_engine->newUndefined();
+                                }
+                                g_deviceDestroyed = true;
+                                wgpuDeviceDestroy(g_device);
+                            }
+                            return g_engine->newUndefined();
+                        }));
+                    g_jsDevice = device;
+                    g_engine->protect(g_jsDevice);
 
-                    // Return the device directly
-                    // await on a non-Promise just returns the value
-                    return device;
+                    return resolved(device);
                 })
             );
 
@@ -4140,44 +4499,30 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
             // We use an array for iteration support with a has() method added
             // Dawn supports indirect-first-instance on Metal which is required for indirect draws
             // with non-zero firstInstance values
-            auto features = g_engine->newArray(0);
-            g_engine->setProperty(features, "has",
-                g_engine->newFunction("has", [](void* ctx, const std::vector<js::JSValueHandle>& args) {
-                    if (args.empty()) return g_engine->newBoolean(false);
-                    std::string featureName = g_engine->toString(args[0]);
-                    // indirect-first-instance is required for indirect draws with non-zero firstInstance
-                    // This is supported by Dawn on all backends
-                    if (featureName == "indirect-first-instance") {
-                        return g_engine->newBoolean(true);
-                    }
-                    // timestamp-query is NOT supported yet - bindings not implemented
-                    return g_engine->newBoolean(false);
-                })
-            );
-            g_engine->setProperty(features, "size", g_engine->newNumber(1));
+            auto features = nativeFeatures(true);
             g_engine->setProperty(adapter, "features", features);
 
             // adapter.limits
-            auto limits = g_engine->newObject();
-            g_engine->setProperty(limits, "maxTextureDimension2D", g_engine->newNumber(8192));
-            g_engine->setProperty(limits, "maxColorAttachmentBytesPerSample", g_engine->newNumber(64));
-            g_engine->setProperty(limits, "maxBindGroups", g_engine->newNumber(4));
-            g_engine->setProperty(limits, "maxBindingsPerBindGroup", g_engine->newNumber(1000));
-            g_engine->setProperty(limits, "maxUniformBufferBindingSize", g_engine->newNumber(65536));
-            g_engine->setProperty(limits, "maxStorageBufferBindingSize", g_engine->newNumber(134217728));
-            g_engine->setProperty(limits, "maxSampledTexturesPerShaderStage", g_engine->newNumber(16));
-            g_engine->setProperty(limits, "maxSamplersPerShaderStage", g_engine->newNumber(16));
-            g_engine->setProperty(limits, "maxStorageTexturesPerShaderStage", g_engine->newNumber(8));
-            g_engine->setProperty(limits, "maxUniformBuffersPerShaderStage", g_engine->newNumber(12));
-            g_engine->setProperty(limits, "maxStorageBuffersPerShaderStage", g_engine->newNumber(8));
-            g_engine->setProperty(limits, "maxDynamicUniformBuffersPerPipelineLayout", g_engine->newNumber(8));
+            auto limits = nativeLimits(true);
             g_engine->setProperty(adapter, "limits", limits);
+            WGPUAdapterInfo nativeInfo = {};
+#if defined(MYSTRAL_WEBGPU_DAWN)
+            if (wgpuAdapterGetInfo(g_adapter, &nativeInfo) != WGPUStatus_Success) {
+                g_engine->throwException("Native WebGPU adapter information query failed");
+                return g_engine->newUndefined();
+            }
+#else
+            wgpuAdapterGetInfo(g_adapter, &nativeInfo);
+#endif
+            auto info = g_engine->newObject();
+#define EXPOSE_ADAPTER_INFO(name) g_engine->setProperty(info, #name, g_engine->newString(copyNativeString(nativeInfo.name).c_str()))
+            EXPOSE_ADAPTER_INFO(vendor); EXPOSE_ADAPTER_INFO(architecture);
+            EXPOSE_ADAPTER_INFO(device); EXPOSE_ADAPTER_INFO(description);
+#undef EXPOSE_ADAPTER_INFO
+            wgpuAdapterInfoFreeMembers(nativeInfo);
+            g_engine->setProperty(adapter, "info", info);
 
-            // Return the adapter directly
-            // await on a non-Promise just returns the value
-            // Three.js: const adapter = await navigator.gpu.requestAdapter()
-            // This works whether we return a Promise or the adapter directly
-            return adapter;
+            return resolved(adapter);
         })
     );
 
@@ -4225,6 +4570,14 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
     engine->setProperty(gpuMapMode, "READ", engine->newNumber(0x1));
     engine->setProperty(gpuMapMode, "WRITE", engine->newNumber(0x2));
     engine->setGlobalProperty("GPUMapMode", gpuMapMode);
+
+    auto gpuColorWrite = engine->newObject();
+    engine->setProperty(gpuColorWrite, "RED", engine->newNumber(WGPUColorWriteMask_Red));
+    engine->setProperty(gpuColorWrite, "GREEN", engine->newNumber(WGPUColorWriteMask_Green));
+    engine->setProperty(gpuColorWrite, "BLUE", engine->newNumber(WGPUColorWriteMask_Blue));
+    engine->setProperty(gpuColorWrite, "ALPHA", engine->newNumber(WGPUColorWriteMask_Alpha));
+    engine->setProperty(gpuColorWrite, "ALL", engine->newNumber(WGPUColorWriteMask_All));
+    engine->setGlobalProperty("GPUColorWrite", gpuColorWrite);
 
     // =========================================================================
     // createImageBitmap() - Standard Web API for image decoding

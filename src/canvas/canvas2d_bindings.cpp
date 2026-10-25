@@ -8,6 +8,7 @@
 #include "mystral/canvas/canvas2d.h"
 #include "mystral/js/engine.h"
 #include <iostream>
+#include <cmath>
 #include <unordered_map>
 
 namespace mystral {
@@ -658,6 +659,21 @@ js::JSValueHandle createCanvas2DContext(js::Engine* engine, int width, int heigh
         })
     );
 
+    engine->setProperty(jsCtx, "__nativeResizeCanvas",
+        engine->newFunction("__nativeResizeCanvas", [ctxPtr](void*, const std::vector<js::JSValueHandle>& args) {
+            if (args.size() < 2) return g_jsEngine->newUndefined();
+            const double width = g_jsEngine->toNumber(args[0]);
+            const double height = g_jsEngine->toNumber(args[1]);
+            if (!std::isfinite(width) || !std::isfinite(height) || width < 0 || height < 0 ||
+                width > 65535 || height > 65535 || std::floor(width) != width || std::floor(height) != height) {
+                g_jsEngine->throwException("Invalid Canvas 2D drawing-buffer dimensions");
+                return g_jsEngine->newUndefined();
+            }
+            ctxPtr->resize(static_cast<int>(width), static_cast<int>(height));
+            return g_jsEngine->newUndefined();
+        })
+    );
+
     // Store this context temporarily for the property interceptor setup
     // This is only needed for the eval() call below and is immediately overwritten
     // when another context is created, but that's fine because we only use it
@@ -676,6 +692,28 @@ js::JSValueHandle createCanvas2DContext(js::Engine* engine, int width, int heigh
             var _font = '10px sans-serif';
             var _textAlign = 'start';
             var _textBaseline = 'alphabetic';
+            var _states = [];
+            var nativeSave = ctx.save;
+            var nativeRestore = ctx.restore;
+            ctx.save = function() {
+                _states.push([_fillStyle, _strokeStyle, _lineWidth, _globalAlpha, _font, _textAlign, _textBaseline]);
+                return nativeSave();
+            };
+            ctx.restore = function() {
+                if (_states.length) {
+                    [_fillStyle, _strokeStyle, _lineWidth, _globalAlpha, _font, _textAlign, _textBaseline] = _states.pop();
+                }
+                return nativeRestore();
+            };
+            ctx.__resizeDrawingBuffer = function(width, height) {
+                ctx.__nativeResizeCanvas(width, height);
+                _fillStyle = _strokeStyle = '#000000';
+                _lineWidth = _globalAlpha = 1;
+                _font = '10px sans-serif';
+                _textAlign = 'start';
+                _textBaseline = 'alphabetic';
+                _states = [];
+            };
 
             Object.defineProperty(ctx, 'fillStyle', {
                 get: function() { return _fillStyle; },

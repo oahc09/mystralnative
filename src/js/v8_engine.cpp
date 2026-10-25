@@ -10,6 +10,10 @@
 
 #include "mystral/js/engine.h"
 #include "mystral/js/module_system.h"
+#include "mystral/http/http_client.h"
+#include <filesystem>
+#include <cctype>
+#include <cstdlib>
 #include <iostream>
 #include <unordered_map>
 #include <unordered_set>
@@ -43,9 +47,26 @@ static bool initializeV8() {
 
     std::cout << "[V8] Initializing V8 JavaScript engine..." << std::endl;
 
-    // Initialize V8
+    // Android packages keep the ABI-specific startup snapshot outside the shared library.
+#if defined(__ANDROID__)
+    const char* snapshot = std::getenv("MYSTRAL_V8_SNAPSHOT");
+    std::error_code snapshotError;
+    if (!snapshot || !*snapshot || !std::filesystem::path(snapshot).is_absolute() ||
+        !std::filesystem::is_regular_file(snapshot, snapshotError) || snapshotError) {
+        std::cerr << "[V8] MYSTRAL_V8_SNAPSHOT must identify an absolute regular snapshot file" << std::endl;
+        return false;
+    }
+    const auto snapshotSize = std::filesystem::file_size(snapshot, snapshotError);
+    if (snapshotError || snapshotSize == 0) {
+        std::cerr << "[V8] Android startup snapshot could not be read or is empty" << std::endl;
+        return false;
+    }
+    v8::V8::InitializeICUDefaultLocation("");
+    v8::V8::InitializeExternalStartupDataFromFile(snapshot);
+#else
     v8::V8::InitializeICUDefaultLocation("");
     v8::V8::InitializeExternalStartupData("");
+#endif
 
     g_platform = v8::platform::NewDefaultPlatform();
     v8::V8::InitializePlatform(g_platform.get());
@@ -74,6 +95,8 @@ public:
         isolate_ = v8::Isolate::New(create_params);
         allocator_ = create_params.array_buffer_allocator;
         isolate_->SetData(0, this);
+        isolate_->SetHostImportModuleDynamicallyCallback(&V8Engine::dynamicImportCallback);
+        isolate_->SetHostInitializeImportMetaObjectCallback(&V8Engine::initializeImportMeta);
 
         // Create context
         v8::Isolate::Scope isolate_scope(isolate_);
@@ -104,10 +127,12 @@ public:
             delete handle;
         }
         frameHandles_.clear();
-        for (auto* fn : frameNativeFunctions_) {
-            delete fn;
+        for (auto* owner : nativeCallbackOwners_) {
+            owner->function.Reset();
+            delete owner->callback;
+            delete owner;
         }
-        frameNativeFunctions_.clear();
+        nativeCallbackOwners_.clear();
         for (auto& entry : moduleCache_) {
             entry.second.Reset();
         }
@@ -136,6 +161,9 @@ public:
 
         // Use module mode to support import.meta
         v8::ScriptOrigin origin(
+#if V8_MAJOR_VERSION < 12
+            isolate_,
+#endif
             v8::String::NewFromUtf8(isolate_, filename).ToLocalChecked(),
             0,                      // line offset
             0,                      // column offset
@@ -188,6 +216,9 @@ public:
 
         // Use module mode to support import.meta
         v8::ScriptOrigin origin(
+#if V8_MAJOR_VERSION < 12
+            isolate_,
+#endif
             v8::String::NewFromUtf8(isolate_, filename).ToLocalChecked(),
             0, 0, false, -1, v8::Local<v8::Value>(), false, false, true);
 
@@ -232,6 +263,9 @@ public:
             v8::String::NewFromUtf8(isolate_, code).ToLocalChecked();
 
         v8::ScriptOrigin origin(
+#if V8_MAJOR_VERSION < 12
+            isolate_,
+#endif
             v8::String::NewFromUtf8(isolate_, filename).ToLocalChecked(),
             0, 0, false, -1, v8::Local<v8::Value>(), false, false, false);
 
@@ -261,6 +295,9 @@ public:
             v8::String::NewFromUtf8(isolate_, code).ToLocalChecked();
 
         v8::ScriptOrigin origin(
+#if V8_MAJOR_VERSION < 12
+            isolate_,
+#endif
             v8::String::NewFromUtf8(isolate_, filename).ToLocalChecked(),
             0, 0, false, -1, v8::Local<v8::Value>(), false, false, false);
 
@@ -551,17 +588,23 @@ public:
         auto* fnPtr = new NativeFunction(fn);
         v8::Local<v8::External> external = v8::External::New(isolate_, fnPtr);
 
-        // Track per-frame NativeFunction allocations for cleanup
-        // Init-time functions (created before beginFrame) are NOT tracked
-        // and persist for the lifetime of the engine
-        // Also skip tracking when suspended (for cached wrapper creation)
-        if (inFrame_ && !frameTrackingSuspended_) {
-            frameNativeFunctions_.push_back(fnPtr);
-        }
-
         // Use Function::New instead of FunctionTemplate::New — lighter weight,
         // avoids SharedFunctionInfo/FeedbackVector accumulation that prevents GC
         v8::Local<v8::Function> func = v8::Function::New(context, nativeCallback, external).ToLocalChecked();
+        // JS wrappers can outlive the frame in which they were created. Release the
+        // native callback only when the corresponding JS function is unreachable.
+        auto* owner = new NativeCallbackOwner();
+        owner->engine = this;
+        owner->callback = fnPtr;
+        owner->function.Reset(isolate_, func);
+        nativeCallbackOwners_.insert(owner);
+        owner->function.SetWeak(owner, [](const v8::WeakCallbackInfo<NativeCallbackOwner>& info) {
+            auto* owner = info.GetParameter();
+            owner->function.Reset();
+            owner->engine->nativeCallbackOwners_.erase(owner);
+            delete owner->callback;
+            delete owner;
+        }, v8::WeakCallbackType::kParameter);
 
         v8::Persistent<v8::Value>* persistent = new v8::Persistent<v8::Value>(isolate_, func);
         frameHandles_.insert(persistent);
@@ -784,6 +827,12 @@ public:
     void beginFrame() override {
         inFrame_ = true;
         isolate_->SetIdle(false);
+        // WebAssembly compilation posts foreground tasks even when no rAF is registered yet.
+        v8::Isolate::Scope isolateScope(isolate_);
+        v8::HandleScope handleScope(isolate_);
+        v8::Context::Scope contextScope(context_.Get(isolate_));
+        while (v8::platform::PumpMessageLoop(g_platform.get(), isolate_)) {}
+        isolate_->PerformMicrotaskCheckpoint();
     }
 
     void clearFrameHandles() override {
@@ -794,12 +843,6 @@ public:
             }
         }
         frameHandles_.clear();
-
-        // Free NativeFunction allocations created during this frame
-        for (auto* fn : frameNativeFunctions_) {
-            delete fn;
-        }
-        frameNativeFunctions_.clear();
 
         inFrame_ = false;
 
@@ -922,9 +965,39 @@ private:
         return "";
     }
 
-    v8::MaybeLocal<v8::Module> resolveModule(v8::Local<v8::Context> context,
-                                             v8::Local<v8::String> specifier,
-                                             v8::Local<v8::Module> referrer) {
+    static bool networkUrl(const std::string& value) {
+        return value.rfind("http://", 0) == 0 || value.rfind("https://", 0) == 0;
+    }
+
+    static std::string moduleUrl(const std::string& filename) {
+        if (networkUrl(filename) || filename.rfind("file://", 0) == 0) return filename;
+        const auto path = std::filesystem::absolute(filename).lexically_normal().generic_string();
+        std::string result = path.front() == '/' ? "file://" : "file:///";
+        const char* hex = "0123456789ABCDEF";
+        for (unsigned char c : path) {
+            if (c <= 32 || c >= 127 || c == '%' || c == '#' || c == '?') {
+                result += '%'; result += hex[c >> 4]; result += hex[c & 15];
+            } else result += static_cast<char>(c);
+        }
+        return result;
+    }
+
+    static void initializeImportMeta(v8::Local<v8::Context> context,
+                                     v8::Local<v8::Module> module,
+                                     v8::Local<v8::Object> meta) {
+        auto* engine = static_cast<V8Engine*>(context->GetIsolate()->GetData(0));
+        if (!engine) return;
+        const auto entry = engine->moduleIdToPath_.find(module->GetIdentityHash());
+        if (entry == engine->moduleIdToPath_.end()) return;
+        const auto url = moduleUrl(entry->second);
+        meta->CreateDataProperty(context,
+            v8::String::NewFromUtf8Literal(context->GetIsolate(), "url"),
+            v8::String::NewFromUtf8(context->GetIsolate(), url.c_str()).ToLocalChecked()).Check();
+    }
+
+    v8::MaybeLocal<v8::Module> resolveModuleName(v8::Local<v8::Context> context,
+                                                const std::string& spec,
+                                                const std::string& referrerName) {
         auto* moduleSystem = getModuleSystem();
         if (!moduleSystem) {
             context->GetIsolate()->ThrowException(v8::Exception::Error(
@@ -932,17 +1005,31 @@ private:
             return v8::MaybeLocal<v8::Module>();
         }
 
-        std::string spec = toStdString(context->GetIsolate(), specifier);
-        std::string referrerName;
-        // v8::Module doesn't have GetScriptOrigin(), so we use a reverse lookup map
-        auto pathIt = moduleIdToPath_.find(referrer->GetIdentityHash());
-        if (pathIt != moduleIdToPath_.end()) {
-            referrerName = pathIt->second;
-        }
-
         ResolvedModule resolved;
         std::string error;
-        if (!moduleSystem->resolveForImport(spec, referrerName, resolved, error)) {
+        const bool remote = networkUrl(spec) || networkUrl(referrerName);
+        if (remote) {
+            v8::Local<v8::Value> constructor;
+            if (!context->Global()->Get(context, v8::String::NewFromUtf8Literal(isolate_, "URL")).ToLocal(&constructor) ||
+                !constructor->IsFunction()) {
+                isolate_->ThrowException(v8::Exception::Error(v8::String::NewFromUtf8Literal(isolate_, "URL is unavailable")));
+                return {};
+            }
+            v8::Local<v8::Value> arguments[] = {
+                v8::String::NewFromUtf8(isolate_, spec.c_str()).ToLocalChecked(),
+                v8::String::NewFromUtf8(isolate_, moduleUrl(referrerName).c_str()).ToLocalChecked()
+            };
+            v8::Local<v8::Object> url;
+            v8::Local<v8::Value> href;
+            if (!constructor.As<v8::Function>()->NewInstance(context, 2, arguments).ToLocal(&url) ||
+                !url->Get(context, v8::String::NewFromUtf8Literal(isolate_, "href")).ToLocal(&href)) return {};
+            resolved.resolved = {toStdString(isolate_, href), false};
+            resolved.format = ModuleFormat::ESM;
+            if (!networkUrl(resolved.resolved.path)) {
+                isolate_->ThrowException(v8::Exception::Error(v8::String::NewFromUtf8Literal(isolate_, "Unsupported module URL scheme")));
+                return {};
+            }
+        } else if (!moduleSystem->resolveForImport(spec, referrerName, resolved, error)) {
             context->GetIsolate()->ThrowException(v8::Exception::Error(
                 v8::String::NewFromUtf8(context->GetIsolate(), error.c_str()).ToLocalChecked()));
             return v8::MaybeLocal<v8::Module>();
@@ -955,13 +1042,26 @@ private:
 
         std::string source;
         std::string filename;
-        if (!moduleSystem->getEsmSource(resolved, referrerName, source, filename, error)) {
+        if (remote) {
+            // Module linking is synchronous in V8. Keep network I/O bounded; loading never rewrites source bytes.
+            auto response = http::getHttpClient().get(resolved.resolved.path);
+            if (!response.ok) {
+                error = "Module HTTP " + std::to_string(response.status) + ": " + resolved.resolved.path + ": " + response.error;
+                isolate_->ThrowException(v8::Exception::Error(v8::String::NewFromUtf8(isolate_, error.c_str()).ToLocalChecked()));
+                return {};
+            }
+            source.assign(response.data.begin(), response.data.end());
+            filename = resolved.resolved.path;
+        } else if (!moduleSystem->getEsmSource(resolved, referrerName, source, filename, error)) {
             context->GetIsolate()->ThrowException(v8::Exception::Error(
                 v8::String::NewFromUtf8(context->GetIsolate(), error.c_str()).ToLocalChecked()));
             return v8::MaybeLocal<v8::Module>();
         }
 
         v8::ScriptOrigin origin(
+#if V8_MAJOR_VERSION < 12
+            isolate_,
+#endif
             v8::String::NewFromUtf8(context->GetIsolate(), filename.c_str()).ToLocalChecked(),
             0, 0, false, -1, v8::Local<v8::Value>(), false, false, true);
 
@@ -977,6 +1077,56 @@ private:
         moduleCache_[resolved.resolved.path].Reset(context->GetIsolate(), module);
         moduleIdToPath_[module->GetIdentityHash()] = resolved.resolved.path;
         return module;
+    }
+
+    v8::MaybeLocal<v8::Module> resolveModule(v8::Local<v8::Context> context,
+                                             v8::Local<v8::String> specifier,
+                                             v8::Local<v8::Module> referrer) {
+        const auto found = moduleIdToPath_.find(referrer->GetIdentityHash());
+        return resolveModuleName(context, toStdString(isolate_, specifier),
+            found == moduleIdToPath_.end() ? std::string() : found->second);
+    }
+
+    static v8::MaybeLocal<v8::Promise> dynamicImportCallback(v8::Local<v8::Context> context,
+                                                            v8::Local<v8::Data>,
+                                                            v8::Local<v8::Value> resourceName,
+                                                            v8::Local<v8::String> specifier,
+                                                            v8::Local<v8::FixedArray>) {
+        auto* isolate = context->GetIsolate();
+        v8::EscapableHandleScope handles(isolate);
+        v8::Local<v8::Promise::Resolver> resolver;
+        if (!v8::Promise::Resolver::New(context).ToLocal(&resolver)) return {};
+        auto promise = resolver->GetPromise();
+        v8::TryCatch caught(isolate);
+        auto* engine = static_cast<V8Engine*>(isolate->GetData(0));
+        v8::Local<v8::Module> module;
+        v8::Local<v8::Value> evaluation;
+        if (!engine || !engine->resolveModuleName(context, toStdString(isolate, specifier),
+                toStdString(isolate, resourceName)).ToLocal(&module) ||
+            (module->GetStatus() == v8::Module::kUninstantiated &&
+                !module->InstantiateModule(context, &V8Engine::moduleResolveCallback).FromMaybe(false)) ||
+            module->GetStatus() == v8::Module::kErrored || !module->Evaluate(context).ToLocal(&evaluation)) {
+            auto error = caught.HasCaught() ? caught.Exception() :
+                (!module.IsEmpty() && module->GetStatus() == v8::Module::kErrored ? module->GetException() :
+                    v8::Exception::Error(v8::String::NewFromUtf8Literal(isolate, "Module import failed")));
+            resolver->Reject(context, error).FromMaybe(false);
+            return handles.Escape(promise);
+        }
+        auto data = v8::Array::New(isolate, 2);
+        data->Set(context, 0, resolver).Check();
+        data->Set(context, 1, module->GetModuleNamespace()).Check();
+        auto fulfilled = v8::Function::New(context, [](const v8::FunctionCallbackInfo<v8::Value>& info) {
+            auto context = info.GetIsolate()->GetCurrentContext();
+            auto data = info.Data().As<v8::Array>();
+            auto resolver = data->Get(context, 0).ToLocalChecked().As<v8::Promise::Resolver>();
+            resolver->Resolve(context, data->Get(context, 1).ToLocalChecked()).FromMaybe(false);
+        }, data).ToLocalChecked();
+        auto rejected = v8::Function::New(context, [](const v8::FunctionCallbackInfo<v8::Value>& info) {
+            info.Data().As<v8::Promise::Resolver>()->Reject(info.GetIsolate()->GetCurrentContext(), info[0]).FromMaybe(false);
+        }, resolver).ToLocalChecked();
+        if (evaluation->IsPromise()) evaluation.As<v8::Promise>()->Then(context, fulfilled, rejected).ToLocalChecked();
+        else resolver->Resolve(context, module->GetModuleNamespace()).FromMaybe(false);
+        return handles.Escape(promise);
     }
 
     static v8::MaybeLocal<v8::Module> moduleResolveCallback(v8::Local<v8::Context> context,
@@ -1042,6 +1192,27 @@ private:
 
         performance->Set(context, v8::String::NewFromUtf8(isolate_, "now").ToLocalChecked(), nowFn).Check();
         context->Global()->Set(context, v8::String::NewFromUtf8(isolate_, "performance").ToLocalChecked(), performance).Check();
+
+        const char* consoleTimers = R"CONSOLE((() => {
+            const timers = new Map();
+            console.time = (label = 'default') => {
+                label = String(label);
+                if (timers.has(label)) { console.warn(`Timer '${label}' already exists`); return; }
+                timers.set(label, performance.now());
+            };
+            const report = (end, label, values) => {
+                label = String(label);
+                if (!timers.has(label)) { console.warn(`Timer '${label}' does not exist`); return; }
+                const elapsed = performance.now() - timers.get(label);
+                if (end) timers.delete(label);
+                console.log(`${label}: ${elapsed} ms`, ...values);
+            };
+            console.timeLog = (label = 'default', ...values) => report(false, label, values);
+            console.timeEnd = (label = 'default') => report(true, label, []);
+            console.assert = (condition, ...values) => { if (!condition) console.error('Assertion failed:', ...values); };
+        })();)CONSOLE";
+        v8::Script::Compile(context, v8::String::NewFromUtf8(isolate_, consoleTimers).ToLocalChecked())
+            .ToLocalChecked()->Run(context).ToLocalChecked();
 
         // setTimeout / clearTimeout (basic stubs)
         v8::Local<v8::Function> setTimeoutFn = v8::FunctionTemplate::New(isolate_, [](const v8::FunctionCallbackInfo<v8::Value>& info) {
@@ -1162,6 +1333,12 @@ private:
         v8::Isolate* isolate = nullptr;
     };
 
+    struct NativeCallbackOwner {
+        V8Engine* engine = nullptr;
+        NativeFunction* callback = nullptr;
+        v8::Global<v8::Function> function;
+    };
+
     v8::Isolate* isolate_ = nullptr;
     v8::ArrayBuffer::Allocator* allocator_ = nullptr;
     v8::Global<v8::Context> context_;
@@ -1171,13 +1348,16 @@ private:
     std::unordered_map<std::string, v8::Global<v8::Module>> moduleCache_;
     std::unordered_map<int, std::string> moduleIdToPath_;  // Reverse lookup: module hash -> path
     std::unordered_set<v8::Persistent<v8::Value>*> frameHandles_;  // Handles to free at end of frame
-    std::vector<NativeFunction*> frameNativeFunctions_;  // NativeFunction allocations to free at end of frame
+    std::unordered_set<NativeCallbackOwner*> nativeCallbackOwners_;
     bool inFrame_ = false;  // True during animation frame execution
     bool frameTrackingSuspended_ = false;  // When true, skip frame tracking for new allocations
 };
 
 // Factory function
 std::unique_ptr<Engine> createV8Engine() {
+#if defined(__ANDROID__)
+    if (!initializeV8()) return nullptr;
+#endif
     return std::make_unique<V8Engine>();
 }
 

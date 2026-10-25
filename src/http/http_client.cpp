@@ -13,6 +13,12 @@
 // Android: TODO: Implement using HttpURLConnection via JNI
 
 #include <iostream>
+#ifdef MYSTRAL_HTTP_ANDROID
+#include <SDL3/SDL_system.h>
+#include <jni.h>
+#include <algorithm>
+#include <limits>
+#endif
 
 namespace mystral {
 namespace http {
@@ -35,7 +41,86 @@ HttpResponse HttpClient::request(const std::string& method, const std::string& u
     response.ok = false;
     response.status = 0;
 #ifdef MYSTRAL_HTTP_ANDROID
-    response.error = "HTTP client not implemented on Android yet";
+    response.url = url;
+    if (!options.verifySSL) {
+        response.error = "Android HTTP requires certificate verification";
+        return response;
+    }
+    auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
+    if (!env || env->PushLocalFrame(32) < 0) {
+        response.error = "Android HTTP JNI environment is unavailable";
+        return response;
+    }
+    struct LocalFrame { JNIEnv* env; ~LocalFrame() { env->PopLocalFrame(nullptr); } } frame{env};
+    auto activity = static_cast<jobject>(SDL_GetAndroidActivity());
+    if (!activity) { response.error = "Android HTTP Activity is unavailable"; return response; }
+    auto activityClass = env->GetObjectClass(activity);
+    auto request = env->GetStaticMethodID(activityClass, "performHttpRequest",
+        "(Ljava/lang/String;Ljava/lang/String;[B[Ljava/lang/String;I)Lcom/mystral/engine/MystralActivity$HttpResult;");
+    if (env->ExceptionCheck() || !request) {
+        env->ExceptionClear(); response.error = "Android HTTP bridge method is unavailable"; return response;
+    }
+    if (body.size() > static_cast<size_t>(std::numeric_limits<jsize>::max()) ||
+        options.headers.size() > static_cast<size_t>(std::numeric_limits<jsize>::max() / 2)) {
+        response.error = "Android HTTP request is too large"; return response;
+    }
+    auto bodyArray = env->NewByteArray(static_cast<jsize>(body.size()));
+    if (!body.empty()) env->SetByteArrayRegion(bodyArray, 0, static_cast<jsize>(body.size()), reinterpret_cast<const jbyte*>(body.data()));
+    auto stringClass = env->FindClass("java/lang/String");
+    auto headers = env->NewObjectArray(static_cast<jsize>(options.headers.size() * 2), stringClass, nullptr);
+    jsize index = 0;
+    for (const auto& header : options.headers) {
+        auto key = env->NewStringUTF(header.first.c_str());
+        auto value = env->NewStringUTF(header.second.c_str());
+        env->SetObjectArrayElement(headers, index++, key);
+        env->SetObjectArrayElement(headers, index++, value);
+        env->DeleteLocalRef(key); env->DeleteLocalRef(value);
+    }
+    const auto seconds = std::min<long>(options.timeout > 0 ? options.timeout : 30, 3600);
+    auto result = env->CallStaticObjectMethod(activityClass, request, env->NewStringUTF(method.c_str()),
+        env->NewStringUTF(url.c_str()), bodyArray, headers, static_cast<jint>(seconds * 1000));
+    if (env->ExceptionCheck() || !result) {
+        env->ExceptionClear(); response.error = "Android HTTP request failed in Java"; return response;
+    }
+    auto resultClass = env->GetObjectClass(result);
+    auto statusField = env->GetFieldID(resultClass, "status", "I");
+    auto errorField = env->GetFieldID(resultClass, "error", "Ljava/lang/String;");
+    auto urlField = env->GetFieldID(resultClass, "url", "Ljava/lang/String;");
+    auto headersField = env->GetFieldID(resultClass, "headers", "[Ljava/lang/String;");
+    auto bodyField = env->GetFieldID(resultClass, "body", "[B");
+    if (env->ExceptionCheck() || !statusField || !errorField || !urlField || !headersField || !bodyField) {
+        env->ExceptionClear(); response.error = "Android HTTP response fields are unavailable"; return response;
+    }
+    auto text = [env](jstring value) {
+        std::string result;
+        if (value) {
+            const char* utf = env->GetStringUTFChars(value, nullptr);
+            if (utf) { result = utf; env->ReleaseStringUTFChars(value, utf); }
+        }
+        return result;
+    };
+    response.status = env->GetIntField(result, statusField);
+    response.error = text(static_cast<jstring>(env->GetObjectField(result, errorField)));
+    auto actualUrl = text(static_cast<jstring>(env->GetObjectField(result, urlField)));
+    if (!actualUrl.empty()) response.url = actualUrl;
+    auto output = static_cast<jbyteArray>(env->GetObjectField(result, bodyField));
+    if (output) {
+        const auto length = env->GetArrayLength(output);
+        response.data.resize(static_cast<size_t>(length));
+        if (length) env->GetByteArrayRegion(output, 0, length, reinterpret_cast<jbyte*>(response.data.data()));
+    }
+    auto pairs = static_cast<jobjectArray>(env->GetObjectField(result, headersField));
+    if (pairs) for (jsize i = 0; i + 1 < env->GetArrayLength(pairs); i += 2) {
+        auto key = static_cast<jstring>(env->GetObjectArrayElement(pairs, i));
+        auto value = static_cast<jstring>(env->GetObjectArrayElement(pairs, i + 1));
+        response.headers[text(key)] = text(value);
+        env->DeleteLocalRef(key); env->DeleteLocalRef(value);
+    }
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear(); response.error = "Android HTTP response conversion failed";
+    }
+    response.ok = response.error.empty() && response.status >= 200 && response.status < 300;
+    return response;
 #else
     response.error = "HTTP client not implemented on iOS yet";
 #endif
@@ -44,13 +129,9 @@ HttpResponse HttpClient::request(const std::string& method, const std::string& u
 }
 
 // Global instance
-static std::unique_ptr<HttpClient> g_httpClient;
-
 HttpClient& getHttpClient() {
-    if (!g_httpClient) {
-        g_httpClient = std::make_unique<HttpClient>();
-    }
-    return *g_httpClient;
+    static HttpClient client;
+    return client;
 }
 
 } // namespace http
