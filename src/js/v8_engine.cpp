@@ -24,6 +24,10 @@
 #include "v8.h"
 #include "libplatform/libplatform.h"
 
+#ifndef MYSTRAL_V8_EXTERNAL_STARTUP_DATA
+#define MYSTRAL_V8_EXTERNAL_STARTUP_DATA 1
+#endif
+
 namespace mystral {
 namespace js {
 
@@ -37,6 +41,11 @@ static std::unordered_map<void*, NativeFunction> g_nativeFunctions;
 // Global set of protected handles that should not be deleted by nativeCallback cleanup
 static std::unordered_set<void*> g_protectedHandles;
 
+// The Android bridge reports the version of the library that is actually linked.
+const char* getV8Version() {
+    return v8::V8::GetVersion();
+}
+
 /**
  * Initialize V8 (call once at startup)
  */
@@ -47,8 +56,8 @@ static bool initializeV8() {
 
     std::cout << "[V8] Initializing V8 JavaScript engine..." << std::endl;
 
-    // Android packages keep the ABI-specific startup snapshot outside the shared library.
-#if defined(__ANDROID__)
+    // Android builds explicitly select external or library-embedded startup data.
+#if defined(__ANDROID__) && MYSTRAL_V8_EXTERNAL_STARTUP_DATA
     const char* snapshot = std::getenv("MYSTRAL_V8_SNAPSHOT");
     std::error_code snapshotError;
     if (!snapshot || !*snapshot || !std::filesystem::path(snapshot).is_absolute() ||
@@ -63,6 +72,8 @@ static bool initializeV8() {
     }
     v8::V8::InitializeICUDefaultLocation("");
     v8::V8::InitializeExternalStartupDataFromFile(snapshot);
+#elif defined(__ANDROID__)
+    v8::V8::InitializeICUDefaultLocation("");
 #else
     v8::V8::InitializeICUDefaultLocation("");
     v8::V8::InitializeExternalStartupData("");

@@ -98,6 +98,8 @@ final class InteropServer {
         return new JSONObject().put("schema", "air-android-interop-session-v1")
                 .put("runId", runId).put("caseId", caseId).put("pid", Process.myPid())
                 .put("demo", caseId.equals("demo"))
+                .put("v8StartupMode", runtime.getString("v8StartupMode"))
+                .put("v8Version", runtime.getString("v8Version"))
                 .put("origin", origin).put("token", token)
                 .put("entryUrl", origin + "/entry.js").put("bundleUrl", origin + "/sdk/cocosair.module.js")
                 .put("assetBaseUrl", origin + "/sdk/webgpu/").put("assetRootUrl", origin + "/assets/")
@@ -106,7 +108,19 @@ final class InteropServer {
                 .put("eventUrl", origin + "/event");
     }
 
+    synchronized void startup(String abi, String mode, String version) throws Exception {
+        if ((!abi.equals("x86_64") && !abi.equals("arm64-v8a")) ||
+                (!mode.equals("embedded") && !mode.equals("external")) || version.isEmpty())
+            throw new IllegalArgumentException("Invalid actual native V8 startup identity");
+        if (runtime.has("v8StartupMode") && (!abi.equals(runtime.getString("loadedABI")) ||
+                !mode.equals(runtime.getString("v8StartupMode")) || !version.equals(runtime.getString("v8Version"))))
+            throw new IllegalStateException("Native V8 startup identity changed");
+        runtime.put("loadedABI", abi).put("v8StartupMode", mode).put("v8Version", version);
+    }
+
     synchronized void snapshot(String abi, File file, String hash) throws Exception {
+        if (!runtime.getString("v8StartupMode").equals("external"))
+            throw new IllegalStateException("Embedded V8 must not request an external snapshot");
         runtime.put("loadedABI", abi).put("snapshotPath", file.getAbsolutePath()).put("snapshotSha256", hash);
         writeNew(new File(directory, "snapshot-receipt.json"), runtime.toString().getBytes(StandardCharsets.UTF_8));
     }
@@ -117,8 +131,9 @@ final class InteropServer {
                 .put("sha256", hash).toString().getBytes(StandardCharsets.UTF_8));
     }
 
-    synchronized void nativeReady(String abi, String engine, String backend) {
+    synchronized void nativeReady(String abi, String engine, String backend, String mode, String version) {
         try {
+            startup(abi, mode, version);
             runtime.put("loadedABI", abi).put("jsEngine", engine).put("backend", backend).put("nativeStarted", true);
             writeNew(new File(directory, "native-ready.json"), runtime.toString().getBytes(StandardCharsets.UTF_8));
             Log.i("MystralInterop", "NATIVE_READY " + runtime.toString());

@@ -10,6 +10,14 @@
 #include <string>
 #include <unistd.h>
 
+#ifndef MYSTRAL_V8_EXTERNAL_STARTUP_DATA
+#define MYSTRAL_V8_EXTERNAL_STARTUP_DATA 1
+#endif
+
+#if defined(MYSTRAL_JS_V8)
+namespace mystral { namespace js { const char* getV8Version(); } }
+#endif
+
 static void exitStage(const char* stage) {
     __android_log_print(ANDROID_LOG_INFO, "MystralInterop", "EXIT_STAGE %s pid=%d thread=%llu",
         stage, static_cast<int>(getpid()), static_cast<unsigned long long>(SDL_GetCurrentThreadID()));
@@ -25,9 +33,35 @@ static const char* compiledAbi() {
 #endif
 }
 
+static const char* compiledV8StartupMode() {
+#if MYSTRAL_V8_EXTERNAL_STARTUP_DATA
+    return "external";
+#else
+    return "embedded";
+#endif
+}
+
+static const char* actualV8Version() {
+#if defined(MYSTRAL_JS_V8)
+    return mystral::js::getV8Version();
+#else
+    return "";
+#endif
+}
+
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_mystral_engine_MystralActivity_nativeCompiledAbi(JNIEnv* env, jclass) {
     return env->NewStringUTF(compiledAbi());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_mystral_engine_MystralActivity_nativeV8StartupMode(JNIEnv* env, jclass) {
+    return env->NewStringUTF(compiledV8StartupMode());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_mystral_engine_MystralActivity_nativeV8Version(JNIEnv* env, jclass) {
+    return env->NewStringUTF(actualV8Version());
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -55,8 +89,11 @@ static void notifyJava(const char* name, const char* signature, const char* erro
             jstring abi = env->NewStringUTF(compiledAbi());
             jstring engine = env->NewStringUTF(mystral::getJSEngine());
             jstring backend = env->NewStringUTF(mystral::getWebGPUBackend());
-            env->CallStaticVoidMethod(type, method, abi, engine, backend);
+            jstring startupMode = env->NewStringUTF(compiledV8StartupMode());
+            jstring v8Version = env->NewStringUTF(actualV8Version());
+            env->CallStaticVoidMethod(type, method, abi, engine, backend, startupMode, v8Version);
             env->DeleteLocalRef(abi); env->DeleteLocalRef(engine); env->DeleteLocalRef(backend);
+            env->DeleteLocalRef(startupMode); env->DeleteLocalRef(v8Version);
         }
     }
     if (env->ExceptionCheck()) {
@@ -84,13 +121,19 @@ static int reportedOutcome() {
 extern "C" __attribute__((visibility("default"))) int SDL_main(int argc, char* argv[]) {
     int result = 1;
     std::string failure;
-    if (argc < 4 || !argv[1] || !argv[2] || !argv[3] || argv[1][0] != '/' || argv[3][0] != '/') {
-        failure = "Native entry requires a private absolute entry, JSON configuration and V8 snapshot";
+    if (argc < 3 || !argv[1] || !argv[2] || argv[1][0] != '/') {
+        failure = "Native entry requires a private absolute entry and JSON configuration";
     } else {
-        std::ifstream snapshot(argv[3], std::ios::binary | std::ios::ate);
-        if (!snapshot || snapshot.tellg() <= 0 || setenv("MYSTRAL_V8_SNAPSHOT", argv[3], 1) != 0) {
-            failure = "Cannot select the packaged V8 snapshot for the actual loaded ABI";
+#if MYSTRAL_V8_EXTERNAL_STARTUP_DATA
+        if (argc < 4 || !argv[3] || argv[3][0] != '/') {
+            failure = "External V8 requires a private absolute snapshot for the actual loaded ABI";
         } else {
+            std::ifstream snapshot(argv[3], std::ios::binary | std::ios::ate);
+            if (!snapshot || snapshot.tellg() <= 0 || setenv("MYSTRAL_V8_SNAPSHOT", argv[3], 1) != 0)
+                failure = "Cannot select the packaged V8 snapshot for the actual loaded ABI";
+        }
+#endif
+        if (failure.empty()) {
             mystral::RuntimeConfig config;
             config.width = 320;
             config.height = 240;
@@ -99,7 +142,8 @@ extern "C" __attribute__((visibility("default"))) int SDL_main(int argc, char* a
             auto runtime = mystral::Runtime::create(config);
             if (!runtime) failure = "Native runtime creation failed";
             else {
-                notifyJava("onNativeReady", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
+                notifyJava("onNativeReady",
+                    "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
                 std::string setup = "globalThis.__MYSTRAL_INTEROP__ = " + std::string(argv[2]) + ";";
                 if (!runtime->evalScript(setup, "<android-interop-config>")) failure = "Interop configuration failed";
                 else if (!runtime->loadScript(argv[1])) failure = "Packaged native entry failed to load";

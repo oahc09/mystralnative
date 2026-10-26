@@ -58,6 +58,7 @@ public class MystralActivity extends SDLActivity {
         try {
             server = new InteropServer(this, getIntent().getStringExtra("run_id"),
                     getIntent().getStringExtra("case_id"));
+            server.startup(nativeCompiledAbi(), nativeV8StartupMode(), nativeV8Version());
             server.start();
             record("created");
         } catch (Exception error) {
@@ -123,14 +124,19 @@ public class MystralActivity extends SDLActivity {
             String abi = nativeCompiledAbi();
             if (!abi.equals("x86_64") && !abi.equals("arm64-v8a"))
                 throw new IllegalStateException("Unsupported loaded native ABI: " + abi);
-            File snapshot = new File(server.directory(), "snapshot_blob.bin");
-            byte[] bytes;
-            try (InputStream input = getAssets().open("v8/" + abi + "/snapshot_blob.bin")) {
-                bytes = readBytes(input, 16 * 1024 * 1024);
+            String startupMode = nativeV8StartupMode();
+            server.startup(abi, startupMode, nativeV8Version());
+            File snapshot = null;
+            if (startupMode.equals("external")) {
+                snapshot = new File(server.directory(), "snapshot_blob.bin");
+                byte[] bytes;
+                try (InputStream input = getAssets().open("v8/" + abi + "/snapshot_blob.bin")) {
+                    bytes = readBytes(input, 16 * 1024 * 1024);
+                }
+                if (bytes.length == 0) throw new IllegalStateException("Empty V8 snapshot");
+                InteropServer.writeNew(snapshot, bytes);
+                server.snapshot(abi, snapshot, InteropServer.sha256(bytes));
             }
-            if (bytes.length == 0) throw new IllegalStateException("Empty V8 snapshot");
-            InteropServer.writeNew(snapshot, bytes);
-            server.snapshot(abi, snapshot, InteropServer.sha256(bytes));
             byte[] entry;
             try (InputStream input = getAssets().open("interop/entry.js")) {
                 entry = readBytes(input, 4 * 1024 * 1024);
@@ -139,10 +145,12 @@ public class MystralActivity extends SDLActivity {
             InteropServer.writeNew(entryFile, entry);
             server.entry(entryFile, InteropServer.sha256(entry));
             JSONObject config = server.configuration();
-            config.put("snapshotPath", snapshot.getAbsolutePath());
+            if (snapshot != null) config.put("snapshotPath", snapshot.getAbsolutePath());
             config.put("entryPath", entryFile.getAbsolutePath());
             config.put("entrySha256", InteropServer.sha256(entry));
-            arguments = new String[] {entryFile.getAbsolutePath(), config.toString(), snapshot.getAbsolutePath()};
+            arguments = snapshot == null
+                    ? new String[] {entryFile.getAbsolutePath(), config.toString()}
+                    : new String[] {entryFile.getAbsolutePath(), config.toString(), snapshot.getAbsolutePath()};
             return arguments.clone();
         } catch (Exception error) {
             Log.e("MystralInterop", "Cannot prepare native entry", error);
@@ -152,11 +160,14 @@ public class MystralActivity extends SDLActivity {
     }
 
     private static native String nativeCompiledAbi();
+    private static native String nativeV8StartupMode();
+    private static native String nativeV8Version();
     private static native void nativeRequestQuit();
 
-    public static void onNativeReady(String abi, String engine, String backend) {
+    public static void onNativeReady(String abi, String engine, String backend, String startupMode, String v8Version) {
         MystralActivity activity = current;
-        if (activity != null && activity.server != null) activity.server.nativeReady(abi, engine, backend);
+        if (activity != null && activity.server != null)
+            activity.server.nativeReady(abi, engine, backend, startupMode, v8Version);
     }
 
     public static void onNativeFinished(int code, String error) {
