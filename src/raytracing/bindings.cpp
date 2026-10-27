@@ -10,6 +10,7 @@
 #include "bindings.h"
 #include "rt_common.h"
 #include "mystral/js/engine.h"
+#include "mystral/webgpu/context.h"
 #include <iostream>
 #include <unordered_map>
 #include <cstring>
@@ -433,7 +434,8 @@ static js::JSValueHandle js_traceRays(void* ctx, const std::vector<js::JSValueHa
 
     // Get output texture (WebGPU texture handle)
     auto outputTextureVal = engine->getProperty(options, "outputTexture");
-    void* outputTexture = engine->getPrivateData(outputTextureVal);
+    void* outputTexture = webgpu::resolveResourceData(engine->getPrivateData(outputTextureVal));
+    if (!outputTexture) return engine->newUndefined();
 
     TraceRaysOptions traceOptions = {};
     traceOptions.tlas = tlasIt->second;

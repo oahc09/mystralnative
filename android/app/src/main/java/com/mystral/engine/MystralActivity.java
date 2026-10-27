@@ -11,6 +11,7 @@ import android.os.Process;
 import android.os.SystemClock;
 import android.util.Log;
 import android.view.PixelCopy;
+import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.widget.RelativeLayout;
@@ -77,14 +78,17 @@ public class MystralActivity extends SDLActivity {
         surface.setLayoutParams(layout);
         surface.getHolder().addCallback(new SurfaceHolder.Callback() {
             @Override public void surfaceCreated(SurfaceHolder holder) {
-                surfaceGeneration.incrementAndGet();
+                int generation = surfaceGeneration.incrementAndGet();
+                nativeSurfaceChanged(holder.getSurface(), generation);
                 record("surface-created");
             }
             @Override public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+                nativeSurfaceChanged(holder.getSurface(), surfaceGeneration.get());
                 record("surface-changed");
             }
             @Override public void surfaceDestroyed(SurfaceHolder holder) {
-                surfaceGeneration.incrementAndGet();
+                int generation = surfaceGeneration.incrementAndGet();
+                nativeSurfaceChanged(null, generation);
                 record("surface-destroyed");
             }
         });
@@ -163,6 +167,7 @@ public class MystralActivity extends SDLActivity {
     private static native String nativeV8StartupMode();
     private static native String nativeV8Version();
     private static native void nativeRequestQuit();
+    private static native void nativeSurfaceChanged(Surface surface, int generation);
 
     public static void onNativeReady(String abi, String engine, String backend, String startupMode, String v8Version) {
         MystralActivity activity = current;

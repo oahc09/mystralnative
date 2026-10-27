@@ -6,6 +6,7 @@
  */
 
 #include "mystral/platform/input.h"
+#include "mystral/platform/window.h"
 #include <iostream>
 #include <cstdlib>
 #include <SDL3/SDL.h>
@@ -37,6 +38,14 @@ struct Window {
 };
 
 static Window g_window;
+
+#if defined(__ANDROID__)
+static std::function<bool()> g_androidEventPreparation;
+
+void setAndroidEventPreparation(std::function<bool()> prepare) {
+    g_androidEventPreparation = prepare;
+}
+#endif
 
 /**
  * Initialize SDL and create window
@@ -109,6 +118,9 @@ bool createWindow(const char* title, int width, int height, bool fullscreen, boo
  */
 void destroyWindow() {
     std::cout << "[Window] Destroying window..." << std::endl;
+#if defined(__ANDROID__)
+    g_androidEventPreparation = {};
+#endif
 
 #if defined(__APPLE__)
     if (g_window.metalView) {
@@ -137,6 +149,12 @@ void destroyWindow() {
 bool pollEvents() {
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
+#if defined(__ANDROID__)
+        // Polling may have blocked through pause/resume. Rebind presentation
+        // before resize or input callbacks can synchronously execute user JS.
+        const bool prepared = !g_androidEventPreparation || g_androidEventPreparation();
+        if (!prepared && event.type != SDL_EVENT_QUIT) continue;
+#endif
         switch (event.type) {
             case SDL_EVENT_QUIT:
                 std::cout << "[Window] Quit event received" << std::endl;
@@ -183,6 +201,10 @@ bool pollEvents() {
                 break;
         }
     }
+#if defined(__ANDROID__)
+    // A blocking poll can also return with no queued SDL event at all.
+    if (g_androidEventPreparation) g_androidEventPreparation();
+#endif
 
     return !g_window.shouldQuit;
 }

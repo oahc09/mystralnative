@@ -18,6 +18,9 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <chrono>
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
 
 #if defined(MYSTRAL_JS_V8)
 
@@ -894,10 +897,15 @@ public:
 
         weakData->persistent.SetWeak(weakData, [](const v8::WeakCallbackInfo<WeakRef>& data) {
             WeakRef* ref = data.GetParameter();
-            ref->callback();  // Release the Dawn resource
-            ref->isolate->AdjustAmountOfExternalAllocatedMemory(-kExternalResourceSize);
+            // V8's first pass permits only resetting this persistent handle.
+            // Native release and external-memory accounting run in pass two.
             ref->persistent.Reset();
-            delete ref;
+            data.SetSecondPassCallback([](const v8::WeakCallbackInfo<WeakRef>& secondPass) {
+                WeakRef* ref = secondPass.GetParameter();
+                ref->callback();
+                ref->isolate->AdjustAmountOfExternalAllocatedMemory(-kExternalResourceSize);
+                delete ref;
+            });
         }, v8::WeakCallbackType::kParameter);
     }
 
@@ -1250,6 +1258,31 @@ private:
         v8::HandleScope handle_scope(isolate_);
         v8::String::Utf8Value exception(isolate_, try_catch.Exception());
         const char* exception_string = *exception ? *exception : "<string conversion failed>";
+#if defined(__ANDROID__)
+        // Android does not retain this process's std::cerr in the interop log.
+        // Observe caught callback failures without changing their propagation,
+        // RAF scheduling, diagnostic history, or native resource lifetime.
+        static uint64_t exceptionSequence = 0;
+        const auto sequence = ++exceptionSequence;
+        const auto logField = [sequence](const char* field, const std::string& value) {
+            constexpr size_t limit = 4096, chunkBytes = 512;
+            const size_t bytes = value.size() < limit ? value.size() : limit;
+            const size_t parts = bytes ? (bytes + chunkBytes - 1) / chunkBytes : 1;
+            for (size_t index = 0; index < parts; ++index) {
+                const auto chunk = value.substr(index * chunkBytes, bytes - index * chunkBytes < chunkBytes ?
+                    bytes - index * chunkBytes : chunkBytes);
+                __android_log_print(ANDROID_LOG_ERROR, "MystralJS", "V8_EXCEPTION %llu %s %zu/%zu truncated=%d %s",
+                    static_cast<unsigned long long>(sequence), field, index, parts,
+                    value.size() > limit ? 1 : 0, chunk.c_str());
+            }
+        };
+        logField("message", exception_string);
+        v8::Local<v8::Value> stack;
+        if (try_catch.StackTrace(isolate_->GetCurrentContext()).ToLocal(&stack) && stack->IsString()) {
+            v8::String::Utf8Value text(isolate_, stack);
+            if (*text) logField("stack", *text);
+        }
+#endif
 
         v8::Local<v8::Message> message = try_catch.Message();
         if (message.IsEmpty()) {

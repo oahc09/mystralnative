@@ -11,6 +11,9 @@ typedef struct WGPUAdapterImpl* WGPUAdapter;
 typedef struct WGPUDeviceImpl* WGPUDevice;
 typedef struct WGPUQueueImpl* WGPUQueue;
 struct WGPUSurfaceDescriptor;
+#if defined(__ANDROID__)
+struct ANativeWindow;
+#endif
 
 namespace mystral {
 namespace webgpu {
@@ -23,6 +26,10 @@ void cleanupDeviceBindings();
 // A presentation surface may cache a swapchain after Unconfigure. Retire it before device teardown.
 bool releaseContextSurfaceBeforeDeviceDestroy(WGPUDevice device);
 void retireSurfaceBindings(WGPUSurface surface);
+void suspendSurfaceBindings(WGPUSurface surface);
+bool restoreSurfaceBindings(WGPUSurface surface);
+// Resolve a private managed-resource token, rejecting expired API references.
+void* resolveResourceData(void* data);
 
 /**
  * WebGPU Context
@@ -36,6 +43,10 @@ public:
     ~Context();
     // The single-device Runtime must be recreated after device destruction.
     void releaseSurfaceBeforeDeviceDestroy();
+#if defined(__ANDROID__)
+    // Replace only presentation; the instance, adapter, device and queue stay alive.
+    bool replaceAndroidSurface(void* nativeWindow);
+#endif
 
     /**
      * Initialize WebGPU - create instance only
@@ -176,6 +187,11 @@ private:
 
     WGPUInstance instance_ = nullptr;
     WGPUSurface surface_ = nullptr;
+#if defined(__ANDROID__)
+    // Context holds one explicit reference until its one presentation Surface
+    // retires, including when Runtime temporarily has no visible window.
+    ANativeWindow* androidNativeWindow_ = nullptr;
+#endif
     WGPUAdapter adapter_ = nullptr;
     WGPUDevice device_ = nullptr;
     WGPUQueue queue_ = nullptr;

@@ -18,6 +18,7 @@
 #endif
 #if defined(__ANDROID__)
 #include <android/log.h>
+#include <android/native_window.h>
 #endif
 
 // stb_image_write declaration (implementation is in stb_impl.cpp)
@@ -270,7 +271,14 @@ bool releaseContextSurfaceBeforeDeviceDestroy(WGPUDevice device) {
 }
 
 void Context::releaseSurfaceBeforeDeviceDestroy() {
-    if (!surface_) return;
+    if (!surface_) {
+#if defined(__ANDROID__)
+        if (androidNativeWindow_) ANativeWindow_release(androidNativeWindow_);
+        androidNativeWindow_ = nullptr;
+        __android_log_print(ANDROID_LOG_INFO, "MystralInterop", "SURFACE_CONTEXT_CLEANUP surface=0 window=0 contextWindowRefs=0");
+#endif
+        return;
+    }
 #if defined(__ANDROID__)
     __android_log_print(ANDROID_LOG_INFO, "MystralInterop", "EXIT_STAGE context-surface-release-enter");
 #endif
@@ -281,9 +289,68 @@ void Context::releaseSurfaceBeforeDeviceDestroy() {
     wgpuSurfaceRelease(surface);
     surface_ = nullptr;
 #if defined(__ANDROID__)
+    if (androidNativeWindow_) ANativeWindow_release(androidNativeWindow_);
+    androidNativeWindow_ = nullptr;
     __android_log_print(ANDROID_LOG_INFO, "MystralInterop", "EXIT_STAGE context-surface-release-return");
+    __android_log_print(ANDROID_LOG_INFO, "MystralInterop", "SURFACE_CONTEXT_CLEANUP surface=0 window=0 contextWindowRefs=0");
 #endif
 }
+
+#if defined(__ANDROID__)
+bool Context::replaceAndroidSurface(void* nativeWindow) {
+    if (!instance_ || !device_) return false;
+    if (!nativeWindow) {
+        __android_log_print(ANDROID_LOG_INFO, "MystralInterop",
+            "SURFACE_PAUSE_HOLD_ENTER surface=%p window=%p contextWindowRefs=%d", surface_, androidNativeWindow_, androidNativeWindow_ ? 1 : 0);
+        // Do not destruct the swapchain inside the UI's disappearing-Surface
+        // transition. Keep at most this one Surface/window pair until a real new
+        // window is ready, or normal Context teardown. JS bindings cannot draw it.
+        if (surface_) suspendSurfaceBindings(surface_);
+        __android_log_print(ANDROID_LOG_INFO, "MystralInterop",
+            "SURFACE_PAUSE_HOLD_RETURN surface=%p window=%p contextWindowRefs=%d", surface_, androidNativeWindow_, androidNativeWindow_ ? 1 : 0);
+        return true;
+    }
+    auto* nextWindow = static_cast<ANativeWindow*>(nativeWindow);
+    if (surface_) {
+        // The old swapchain must retire while its device is still alive. This is
+        // called only by the Runtime's SDL/JS owner, never a Surface UI callback.
+        suspendSurfaceBindings(surface_);
+        __android_log_print(ANDROID_LOG_INFO, "MystralInterop",
+            "SURFACE_RETIRE_RELEASE_ENTER surface=%p window=%p contextWindowRefs=%d", surface_, androidNativeWindow_, androidNativeWindow_ ? 1 : 0);
+        wgpuSurfaceRelease(surface_);
+        surface_ = nullptr;
+    }
+    if (androidNativeWindow_) ANativeWindow_release(androidNativeWindow_);
+    androidNativeWindow_ = nullptr;
+    __android_log_print(ANDROID_LOG_INFO, "MystralInterop", "SURFACE_RETIRE_RELEASE_RETURN surface=0 window=0 contextWindowRefs=0");
+    androidNativeWindow_ = nextWindow;
+    // Runtime's input snapshot already owns nextWindow throughout this call.
+    // Acquire our one reference only after the previous pair has retired.
+    ANativeWindow_acquire(androidNativeWindow_);
+
+    WGPUSurfaceDescriptorFromAndroidNativeWindow_Compat androidDesc = {};
+    androidDesc.chain.sType = WGPUSType_SurfaceDescriptorFromAndroidNativeWindow_Compat;
+    androidDesc.window = nativeWindow;
+    WGPUSurfaceDescriptor descriptor = {};
+    descriptor.nextInChain = reinterpret_cast<WGPUChainedStruct*>(&androidDesc);
+    surface_ = wgpuInstanceCreateSurface(instance_, &descriptor);
+    if (!surface_) {
+        ANativeWindow_release(androidNativeWindow_);
+        androidNativeWindow_ = nullptr;
+        return false;
+    }
+    if (!restoreSurfaceBindings(surface_)) {
+        wgpuSurfaceRelease(surface_);
+        surface_ = nullptr;
+        ANativeWindow_release(androidNativeWindow_);
+        androidNativeWindow_ = nullptr;
+        return false;
+    }
+    __android_log_print(ANDROID_LOG_INFO, "MystralInterop",
+        "SURFACE_CONTEXT_WINDOW_RETAIN window=%p contextWindowRefs=1", androidNativeWindow_);
+    return true;
+}
+#endif
 
 Context::~Context() {
     const auto stage = [](const char* value) {
@@ -671,6 +738,16 @@ bool Context::createSurface(void* nativeHandle, int platformType) {
         return false;
     }
     std::cout << "[WebGPU] Surface created" << std::endl;
+#if defined(__ANDROID__)
+    if (platformType == PLATFORM_ANDROID) {
+        auto* window = static_cast<ANativeWindow*>(nativeHandle);
+        ANativeWindow_acquire(window);
+        if (androidNativeWindow_) ANativeWindow_release(androidNativeWindow_);
+        androidNativeWindow_ = window;
+        __android_log_print(ANDROID_LOG_INFO, "MystralInterop",
+            "SURFACE_CONTEXT_WINDOW_RETAIN window=%p contextWindowRefs=1", androidNativeWindow_);
+    }
+#endif
 
     // Now request adapter with surface compatibility
     WGPURequestAdapterOptions adapterOptions = {};

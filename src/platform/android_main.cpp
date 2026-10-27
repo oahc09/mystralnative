@@ -2,12 +2,15 @@
 #ifdef __ANDROID__
 
 #include "mystral/runtime.h"
+#include "mystral/platform/android_surface.h"
 #include <SDL3/SDL.h>
 #include <android/log.h>
+#include <android/native_window_jni.h>
 #include <jni.h>
 #include <cstdlib>
 #include <fstream>
 #include <string>
+#include <mutex>
 #include <unistd.h>
 
 #ifndef MYSTRAL_V8_EXTERNAL_STARTUP_DATA
@@ -17,6 +20,50 @@
 #if defined(MYSTRAL_JS_V8)
 namespace mystral { namespace js { const char* getV8Version(); } }
 #endif
+
+namespace mystral {
+namespace platform {
+namespace {
+std::mutex androidSurfaceMutex;
+AndroidSurfaceState androidSurface;
+}
+
+AndroidSurfaceState acquireAndroidSurfaceState() {
+    std::lock_guard<std::mutex> lock(androidSurfaceMutex);
+    auto state = androidSurface;
+    if (state.window) ANativeWindow_acquire(state.window);
+    return state;
+}
+
+void clearAndroidSurfaceState() {
+    std::lock_guard<std::mutex> lock(androidSurfaceMutex);
+    if (androidSurface.window) ANativeWindow_release(androidSurface.window);
+    androidSurface.window = nullptr;
+    ++androidSurface.revision;
+}
+} // namespace platform
+} // namespace mystral
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_mystral_engine_MystralActivity_nativeSurfaceChanged(JNIEnv* env, jclass, jobject surface, jint generation) {
+    auto* window = surface ? ANativeWindow_fromSurface(env, surface) : nullptr;
+    uint64_t revision;
+    {
+        std::lock_guard<std::mutex> lock(mystral::platform::androidSurfaceMutex);
+        auto& state = mystral::platform::androidSurface;
+        if (generation < state.generation) {
+            if (window) ANativeWindow_release(window);
+            return;
+        }
+        if (state.window) ANativeWindow_release(state.window);
+        state.window = window;
+        state.generation = generation;
+        revision = ++state.revision;
+    }
+    __android_log_print(ANDROID_LOG_INFO, "MystralInterop",
+        "SURFACE_QUEUED generation=%d revision=%llu available=%d window=%p pid=%d",
+        generation, static_cast<unsigned long long>(revision), window ? 1 : 0, window, static_cast<int>(getpid()));
+}
 
 static void exitStage(const char* stage) {
     __android_log_print(ANDROID_LOG_INFO, "MystralInterop", "EXIT_STAGE %s pid=%d thread=%llu",
@@ -165,6 +212,7 @@ extern "C" __attribute__((visibility("default"))) int SDL_main(int argc, char* a
     exitStage("java-exit-notify-enter");
     notifyJava("onNativeFinished", "(ILjava/lang/String;)V", failure.c_str(), result);
     exitStage("java-exit-notify-return");
+    mystral::platform::clearAndroidSurfaceState();
     return result;
 }
 

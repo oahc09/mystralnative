@@ -1,5 +1,9 @@
 #pragma once
 
+#if defined(__ANDROID__)
+#include <functional>
+#endif
+
 // Forward declare SDL types
 struct SDL_Window;
 
@@ -21,6 +25,12 @@ void destroyWindow();
  * @return false if quit event received
  */
 bool pollEvents();
+
+#if defined(__ANDROID__)
+// Runs on the SDL owner after polling, before an event can call JavaScript.
+// Return false while presentation is unavailable; quit is still dispatched.
+void setAndroidEventPreparation(std::function<bool()> prepare);
+#endif
 
 /**
  * Check if window should quit
